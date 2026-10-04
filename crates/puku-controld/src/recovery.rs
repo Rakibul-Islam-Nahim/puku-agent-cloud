@@ -107,12 +107,16 @@ pub async fn recover_session(
         let host = session
             .worker_id
             .ok_or_else(|| RecoveryError::RecoverFailed("no worker_id for remote fence".into()))?;
-        // BMC lookup is the operator's responsibility; for now we pass None
-        // and rely on Ceph blocklist alone (which is the primary fence).
+        // The session's disk is what the old host could still write to, so
+        // that is what gets cut off -- before anything else touches it.
+        // A fence that fails stops the recovery here: never attach
+        // half-fenced. BMC is not passed yet; the storage fence is primary.
+        let volumes: Vec<puku_volume::VolumeId> =
+            driver.current_volume(session.id).await.map_err(RecoveryError::RecoverFailed)?.into_iter().collect();
         fence
-            .fence(host, None)
+            .fence_volumes(host, Some(session.id), &volumes, None)
             .await
-            .map_err(|e| RecoveryError::RecoverFailed(e.to_string()))?;
+            .map_err(|e| RecoveryError::RecoverFailed(format!("fence failed, recovery stopped: {e}")))?;
     }
     let _ = worker_alive; // already used in decide_recovery
 
@@ -196,5 +200,109 @@ mod tests {
     #[test]
     fn desired_stopped_short_circuits() {
         assert_eq!(decide_recovery(&sess(0, "stopped"), true), RecoveryChoice::Local);
+    }
+
+    /// Records the order of operations so tests can assert fence-first.
+    #[derive(Default)]
+    struct Trace(std::sync::Mutex<Vec<String>>);
+    impl Trace {
+        fn push(&self, s: impl Into<String>) {
+            self.0.lock().unwrap().push(s.into());
+        }
+        fn get(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeFence {
+        trace: Arc<Trace>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Fence for FakeFence {
+        async fn blocklist(&self, _h: Uuid) -> Result<(), puku_fence::FenceError> {
+            Ok(())
+        }
+        async fn fence(&self, _h: Uuid, _b: Option<&puku_leases::BmcEndpoint>) -> Result<puku_fence::FenceReceipt, puku_fence::FenceError> {
+            unreachable!("recovery must fence volumes, not just the host")
+        }
+        async fn unfence(&self, _h: Uuid) -> Result<(), puku_fence::FenceError> {
+            Ok(())
+        }
+        async fn fence_volumes(
+            &self,
+            host_id: Uuid,
+            _s: Option<Uuid>,
+            volumes: &[puku_volume::VolumeId],
+            _b: Option<&puku_leases::BmcEndpoint>,
+        ) -> Result<puku_fence::FenceReceipt, puku_fence::FenceError> {
+            self.trace.push(format!("fence {}", volumes.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")));
+            if self.fail {
+                return Err(puku_fence::FenceError::Blocklist("denied".into()));
+            }
+            Ok(puku_fence::FenceReceipt {
+                host_id,
+                blocklisted_at: chrono::Utc::now(),
+                bmc_action: None,
+                audit_log_id: 1,
+                volumes: volumes.iter().map(|v| v.to_string()).collect(),
+                clients: vec![],
+            })
+        }
+    }
+
+    struct FakeDriver {
+        trace: Arc<Trace>,
+    }
+
+    #[async_trait]
+    impl RestoreDriver for FakeDriver {
+        async fn pick_manifest(&self, _s: Uuid, _l: bool) -> Result<Option<puku_snapshot::Manifest>, String> {
+            self.trace.push("pick_manifest");
+            Ok(None)
+        }
+        async fn current_volume(&self, s: Uuid) -> Result<Option<puku_volume::VolumeId>, String> {
+            self.trace.push("current_volume");
+            Ok(Some(puku_volume::VolumeId(format!("puku-sessions/{s}"))))
+        }
+    }
+
+    fn volume() -> Arc<dyn VolumeBackend> {
+        Arc::new(puku_volume::RbdBackend::for_test())
+    }
+
+    #[tokio::test]
+    async fn remote_recovery_fences_the_volume_before_restoring() {
+        let trace = Arc::new(Trace::default());
+        let s = sess(0, "running");
+        let fence = Arc::new(FakeFence { trace: trace.clone(), fail: false });
+        let driver = Arc::new(FakeDriver { trace: trace.clone() });
+        let out = recover_session(s.clone(), RecoveryChoice::Remote, fence, driver, volume(), false).await.unwrap();
+        assert_eq!(out.kind, "ColdHead");
+        let t = trace.get();
+        let fence_at = t.iter().position(|x| x.starts_with("fence ")).expect("fenced");
+        let pick_at = t.iter().position(|x| x == "pick_manifest").expect("restored");
+        assert!(fence_at < pick_at, "fence must come before any restore: {t:?}");
+        assert_eq!(t[fence_at], format!("fence puku-sessions/{}", s.id));
+    }
+
+    #[tokio::test]
+    async fn failed_fence_stops_recovery() {
+        let trace = Arc::new(Trace::default());
+        let fence = Arc::new(FakeFence { trace: trace.clone(), fail: true });
+        let driver = Arc::new(FakeDriver { trace: trace.clone() });
+        let res = recover_session(sess(0, "running"), RecoveryChoice::Remote, fence, driver, volume(), false).await;
+        assert!(matches!(res, Err(RecoveryError::RecoverFailed(m)) if m.contains("fence failed")));
+        assert!(!trace.get().iter().any(|x| x == "pick_manifest"), "nothing restored after a failed fence");
+    }
+
+    #[tokio::test]
+    async fn local_recovery_does_not_fence() {
+        let trace = Arc::new(Trace::default());
+        let fence = Arc::new(FakeFence { trace: trace.clone(), fail: true });
+        let driver = Arc::new(FakeDriver { trace: trace.clone() });
+        recover_session(sess(0, "running"), RecoveryChoice::Local, fence, driver, volume(), true).await.unwrap();
+        assert!(!trace.get().iter().any(|x| x.starts_with("fence ")));
     }
 }

@@ -24,6 +24,10 @@ pub struct FenceReceipt {
     pub blocklisted_at: DateTime<Utc>,
     pub bmc_action: Option<String>, // "power_off"|"power_cycle"|"none"
     pub audit_log_id: i64,
+    /// Volumes cut off at the storage layer, and the client addresses that
+    /// were blocklisted for them. Empty for a host-only fence.
+    pub volumes: Vec<String>,
+    pub clients: Vec<String>,
 }
 
 #[async_trait]
@@ -44,4 +48,16 @@ pub trait Fence: Send + Sync {
 
     /// Reverse blocklist (post-recovery).
     async fn unfence(&self, host_id: Uuid) -> Result<(), FenceError>;
+
+    /// The fence recovery must pass before it attaches `volumes` anywhere
+    /// else: the host is fenced, then every client that has each volume open
+    /// is cut off at the storage layer. `Ok` only when every volume is fenced;
+    /// one failure fails the whole call, so nothing is attached half-fenced.
+    async fn fence_volumes(
+        &self,
+        host_id: Uuid,
+        session_id: Option<Uuid>,
+        volumes: &[puku_volume::VolumeId],
+        bmc: Option<&BmcEndpoint>,
+    ) -> Result<FenceReceipt, FenceError>;
 }

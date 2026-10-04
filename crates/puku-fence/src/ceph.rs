@@ -132,7 +132,54 @@ impl Fence for CephFencer {
             blocklisted_at: chrono::Utc::now(),
             bmc_action,
             audit_log_id: 0, // assigned by AuditSink in production
+            volumes: Vec::new(),
+            clients: Vec::new(),
         })
+    }
+
+    async fn fence_volumes(
+        &self,
+        host_id: Uuid,
+        session_id: Option<Uuid>,
+        volumes: &[puku_volume::VolumeId],
+        bmc: Option<&BmcEndpoint>,
+    ) -> Result<FenceReceipt, FenceError> {
+        let mut receipt = self.fence(host_id, bmc).await?;
+        let mut last_audit = 0;
+        for vol in volumes {
+            match self.volume.fence_volume(vol).await {
+                Ok(clients) => {
+                    last_audit = self
+                        .audit
+                        .write(&AuditEntry {
+                            host_id,
+                            session_id,
+                            action: "blocklist".into(),
+                            outcome: "ok".into(),
+                            detail: serde_json::json!({"volume": vol.as_str(), "clients": clients}),
+                            requested_by: self.instance.clone(),
+                        })
+                        .await;
+                    receipt.volumes.push(vol.to_string());
+                    receipt.clients.extend(clients);
+                }
+                Err(e) => {
+                    self.audit
+                        .write(&AuditEntry {
+                            host_id,
+                            session_id,
+                            action: "blocklist".into(),
+                            outcome: "failed".into(),
+                            detail: serde_json::json!({"volume": vol.as_str(), "error": e.to_string()}),
+                            requested_by: self.instance.clone(),
+                        })
+                        .await;
+                    return Err(FenceError::Blocklist(format!("{vol}: {e}")));
+                }
+            }
+        }
+        receipt.audit_log_id = last_audit;
+        Ok(receipt)
     }
 }
 
@@ -187,6 +234,52 @@ mod tests {
             .await;
         // NotFound because we did not create the volume, but NOT HostFenced.
         assert!(matches!(res, Err(puku_volume::VolumeError::NotFound(_))));
+    }
+
+    fn scripted_rbd(answers: Vec<puku_volume::CmdOutput>) -> Arc<puku_volume::RbdBackend> {
+        let runner = Arc::new(puku_volume::ScriptedRunner::new(answers));
+        Arc::new(puku_volume::RbdBackend::with_runner(
+            puku_volume::RbdBackendConfig::new("puku-base", "puku-sessions"),
+            runner,
+        ))
+    }
+
+    #[tokio::test]
+    async fn fence_volumes_cuts_off_watchers_and_audits_each() {
+        use puku_volume::CmdOutput;
+        let volume = scripted_rbd(vec![
+            CmdOutput::ok(r#"{"watchers":[{"address":"10.0.0.5:0/42"}]}"#),
+            CmdOutput::ok(""),
+            CmdOutput::ok(r#"[{"addr":"10.0.0.5:0/42"}]"#),
+        ]);
+        let audit = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let fencer = CephFencer::new(volume, audit.clone(), "test-instance");
+        let host = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let vol = puku_volume::VolumeId("puku-sessions/s1".into());
+        let r = fencer.fence_volumes(host, Some(session), &[vol], None).await.unwrap();
+        assert_eq!(r.volumes, vec!["puku-sessions/s1".to_string()]);
+        assert_eq!(r.clients, vec!["10.0.0.5:0/42".to_string()]);
+        let entries = audit.entries.lock().await;
+        let per_volume: Vec<_> = entries.iter().filter(|e| e.session_id == Some(session)).collect();
+        assert_eq!(per_volume.len(), 1);
+        assert_eq!(per_volume[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn fence_volumes_fails_when_any_volume_cannot_be_fenced() {
+        use puku_volume::CmdOutput;
+        let volume = scripted_rbd(vec![
+            CmdOutput::ok(r#"{"watchers":[{"address":"10.0.0.5:0/42"}]}"#),
+            CmdOutput::fail(13, "Error EACCES: access denied"),
+        ]);
+        let audit = Arc::new(crate::audit::InMemoryAuditSink::new());
+        let fencer = CephFencer::new(volume, audit.clone(), "test-instance");
+        let vol = puku_volume::VolumeId("puku-sessions/s1".into());
+        let res = fencer.fence_volumes(Uuid::new_v4(), None, &[vol], None).await;
+        assert!(matches!(res, Err(FenceError::Blocklist(_))));
+        let entries = audit.entries.lock().await;
+        assert!(entries.iter().any(|e| e.outcome == "failed"), "the failure is audited");
     }
 
     #[tokio::test]

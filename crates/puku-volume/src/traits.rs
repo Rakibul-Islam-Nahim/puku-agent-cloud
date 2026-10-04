@@ -48,6 +48,14 @@ pub trait VolumeBackend: Send + Sync {
     /// Unblock a host (post-recovery).
     async fn unfence(&self, host: HostId) -> Result<(), VolumeError>;
 
+    /// Cut off every client that currently has `vol` open, at the storage
+    /// layer, before another host attaches it. Returns what was fenced.
+    /// Backends whose volumes cannot be opened from two hosts (local disk)
+    /// have nothing to cut off.
+    async fn fence_volume(&self, _vol: &VolumeId) -> Result<Vec<String>, VolumeError> {
+        Ok(Vec::new())
+    }
+
     /// Fast health check: does `host` currently have I/O access to `vol`?
     async fn is_reachable(&self, vol: &VolumeId, host: HostId) -> Result<bool, VolumeError>;
 }

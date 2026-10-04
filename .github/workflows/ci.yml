@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    # The integration tests drive a real controld against a real database;
+    # without one they skip, which would quietly hollow out the suite.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: puku
+          POSTGRES_PASSWORD: puku
+          POSTGRES_DB: puku_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U puku -d puku_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+
+    env:
+      PUKU_TEST_DATABASE_URL: postgres://puku:puku@127.0.0.1:5432/puku_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No `cargo fmt --check`: this codebase is hand-formatted (dense SQL
+      # string continuations, deliberate one-line call sites) and rustfmt
+      # rewrites every file in it. Adding the gate would mean a repo-wide
+      # reformat that buries real diffs in review noise.
+
+      # workerd pulls in the microsandbox SDK, which needs no KVM to *build*.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # sqlx is used through runtime `query_as`, not the compile-time
+      # macros, so nothing here needs a database at *build* time — but the
+      # integration tests need one at run time (see PUKU_TEST_DATABASE_URL).
+      - name: Test
+        run: cargo test --workspace
+
+      # The guest runner is JavaScript, so cargo never sees it. runner.mjs --
+      # the DEFAULT runner -- silently dropped the memory preamble workerd
+      # writes into the manifest, and nothing in this workspace could have
+      # noticed: no Rust test loads it, and skills/deployment-test has no
+      # memory coverage at all.
+      #
+      # This runs the real runner against the real vendored SDK and the
+      # deterministic fake CLI. No model, no network, no VM.
+      - name: Runner honours the memory preamble
+        run: node images/puku-agent/runner/test/memory-preamble.test.mjs
+
+      # A green suite that skipped every integration test looks identical to
+      # one that ran them. Fail loudly if the database was not reachable.
+      - name: Assert the integration tests actually ran
+        run: |
+          cargo test --workspace inttests:: -- --list \
+            | grep -c ': test' > /tmp/n
+          test "$(cat /tmp/n)" -ge 10 \
+            || { echo "expected >=10 integration tests, found $(cat /tmp/n)"; exit 1; }
+          cargo test --workspace inttests:: 2>&1 | tee /tmp/out
+          grep -qE 'test result: ok\. ([1-9][0-9]*) passed' /tmp/out \
+            || { echo "integration tests did not run — was the database reachable?"; exit 1; }
+
+  image:
+    # Proves the release container still builds; publishing happens on tags.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

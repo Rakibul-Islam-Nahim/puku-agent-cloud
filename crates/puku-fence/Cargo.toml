@@ -1,0 +1,20 @@
+[package]
+name = "puku-fence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+puku-cloud-proto = { workspace = true }
+puku-volume = { workspace = true }
+puku-leases = { workspace = true }
+async-trait = { version = "0.1" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tempfile = "3"

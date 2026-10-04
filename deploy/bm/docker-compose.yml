@@ -1,0 +1,154 @@
+# puku-agent-cloud control plane on a bare-metal box.
+#
+# Copy ONLY this directory onto the host (no app source), fill .env, then:
+#   docker compose pull && docker compose up -d
+#
+# workerd is NOT here: it needs /dev/kvm and the msb toolchain on the host,
+# so it runs as a systemd unit (see ../systemd/puku-workerd.service) and
+# dials OUT to controld. A worker never needs an inbound port.
+
+# Pinned so the two stacks do not collide. Both compose files live in a
+# directory called `bm`, and compose derives the project name from the
+# directory -- without this they would both be project `bm` and fight over
+# container names.
+name: puku-cloud
+
+services:
+  controld:
+    image: ${CONTROLD_IMAGE:?set CONTROLD_IMAGE in .env}
+    restart: unless-stopped
+    environment:
+      # Its own Supabase project. Must be the SESSION pooler on 5432: the
+      # transaction pooler on 6543 has no session state, which breaks advisory
+      # locks and LISTEN/NOTIFY in ways that surface as intermittent nonsense
+      # rather than a connection error.
+      PUKU_DATABASE_URL: ${PUKU_DATABASE_URL:?set PUKU_DATABASE_URL in .env}
+      # Below the pooler's own limit (Supabase session mode: 15). Default 16.
+      PUKU_DATABASE_MAX_CONNECTIONS:
+      PUKU_LISTEN_ADDR: 0.0.0.0:7770
+      PUKU_AUTH: ${PUKU_AUTH:-required}
+      # Per-user identity. Each caller's own platform bearer is verified
+      # here and gets its own org, so ten people sharing one deployment do
+      # not share one identity or one bill. Leave PUKU_PLATFORM_AUTH on
+      # unless every caller is meant to use a shared pkc_ key.
+      PUKU_API_URL: ${PUKU_API_URL:-https://chat.api.puku.sh}
+      PUKU_PLATFORM_AUTH: ${PUKU_PLATFORM_AUTH:-true}
+      PUKU_AGENT_IMAGE:
+      # The workers dial in with per-worker tokens (`gen-worker-token`).
+      # Turn the shared secret off once every host has its own.
+      PUKU_ALLOW_SHARED_WORKER_TOKEN: ${PUKU_ALLOW_SHARED_WORKER_TOKEN:-false}
+      PUKU_WORKER_TOKEN:
+      # Multi-tenant deployments must NOT leave this at bypassPermissions.
+      PUKU_PERMISSION_CEILING: ${PUKU_PERMISSION_CEILING:-bypassPermissions}
+      # Engines and machines (puku-bot computers). Bare names on purpose: an
+      # unset one stays out of the container and controld keeps its default,
+      # where `${X:-}` would pass an empty string the typed settings reject.
+      PUKU_ENGINES_ALLOWED:
+      PUKU_ENGINE_DEFAULT:
+      PUKU_MACHINE_IMAGE:
+      PUKU_MACHINE_MAX_CPUS:
+      PUKU_MACHINE_MAX_MEMORY_MIB:
+      # Base URL machine links are minted under. Unset, it is the listen
+      # address (0.0.0.0:7770), which nothing outside the container can use.
+      PUKU_LINKS_URL:
+      PUKU_SNAPSHOTS:
+      PUKU_SNAPSHOT_KEEP:
+      PUKU_SNAPSHOT_RETAIN_DESTROYED_DAYS:
+      # Object storage (Cloudflare R2). Without it, oversized event payloads
+      # are dropped and archives stay inside the container.
+      PUKU_R2_ENDPOINT:
+      PUKU_R2_BUCKET:
+      # "auto" is R2's value. MinIO and real S3 reject it -- SigV4 signs the
+      # region, so a mismatch is a signature error, not a helpful message.
+      PUKU_R2_REGION: ${PUKU_R2_REGION:-auto}
+      PUKU_R2_ACCESS_KEY_ID:
+      PUKU_R2_SECRET_ACCESS_KEY:
+      # puku-skills-service. Without these a session resolves no skill
+      # packs and the agent improvises instead of following your pptx/pdf
+      # instructions. PUKU_SKILLS_TOKEN is the service-to-service
+      # credential used when the caller has no bearer of their own —
+      # scheduled runs, pkc_ API keys, PUKU_AUTH=off.
+      PUKU_SKILLS_URL:
+      PUKU_SKILLS_TOKEN:
+      # Encrypts stored credentials at rest. WITHOUT IT, a caller's own
+      # bearer cannot be stored, so every session silently falls back to
+      # the operator's global key -- ten users, one bill. controld warns
+      # about this at startup; the warning is easy to scroll past.
+      PUKU_SECRET_KEY: ${PUKU_SECRET_KEY:?set PUKU_SECRET_KEY in .env}
+      # Memory. Both empty -> the platform behaves exactly as it did before
+      # memory existed: every call site degrades to no preamble. Set both and
+      # bring the stack up with `--profile memory`. Setting the URL while the
+      # service is not running is the one bad combination -- controld then
+      # reports the dependency honestly on every preamble fetch.
+      #
+      # NOT `:?` markers: compose interpolates every service, including ones
+      # behind an unused profile, so a required marker here would block `up`
+      # for people who never wanted memory. Same lesson as TUNNEL_TOKEN.
+      # The memory service is its own compose project now, reached over its
+      # public hostname rather than container DNS. Behind Cloudflare Access,
+      # so the service token is required as well as the service key — half a
+      # token is refused at startup rather than 403ing every preamble fetch.
+      PUKU_MEMORY_URL: ${PUKU_MEMORY_URL:-}
+      PUKU_MEMORY_SERVICE_KEY: ${PUKU_MEMORY_SERVICE_KEY:-}
+      PUKU_MEMORY_ACCESS_CLIENT_ID: ${PUKU_MEMORY_ACCESS_CLIENT_ID:-}
+      PUKU_MEMORY_ACCESS_CLIENT_SECRET: ${PUKU_MEMORY_ACCESS_CLIENT_SECRET:-}
+      # MCP connector broker. Empty string disables connectors entirely.
+      PUKU_MCP_PROXY_URL: ${PUKU_MCP_PROXY_URL:-https://mcp.proxy.puku.sh}
+      # Model gateway the guest routes through; defaults to PUKU_API_URL.
+      PUKU_AI_BASE_URL:
+      # Turn ceiling applied when a session does not set its own.
+      PUKU_DEFAULT_MAX_TURNS:
+      # How long finished sessions and their archives are kept.
+      PUKU_RETENTION_DAYS:
+      # Fallback credential for unattended (scheduled) sessions.
+      PUKU_AI_API_KEY:
+      PUKU_GIT_TOKEN:
+      # Error reporting and tracing. Unset = Sentry is off entirely and
+      # controld behaves exactly as it did before.
+      SENTRY_DSN:
+      SENTRY_ENVIRONMENT:
+      RUST_LOG: ${RUST_LOG:-info}
+      # Defaults to ./puku-archive, which under this image resolves to / --
+      # the runtime stage sets USER puku (uid 10001) and no WORKDIR, so the
+      # archive pass fails every minute with a permission error. Point it at
+      # the mount below instead.
+      PUKU_ARCHIVE_DIR: ${PUKU_ARCHIVE_DIR:-/var/lib/puku/archive}
+    volumes:
+      # A bind rather than a named volume: Docker creates a named volume's
+      # mountpoint root-owned, which uid 10001 could not write to either. The
+      # host directory can be chowned once and keeps the archives the native
+      # deployment already wrote.
+      - ${PUKU_ARCHIVE_HOST_DIR:-../../puku-archive}:/var/lib/puku/archive
+    ports:
+      # Loopback by default: public ingress is meant to be the tunnel below,
+      # so the box does not expose 7770 itself. A dev box reached directly
+      # by IP sets BIND_ADDR=0.0.0.0 — and must then set PUKU_AUTH=required
+      # and firewall the port, or anyone who finds it can spend your money.
+      - "${BIND_ADDR:-127.0.0.1}:7770:7770"
+    networks:
+      - default
+      # Shared with callers on this host (puku-bot's api, worker and web), so they
+      # reach controld by name without joining this project's network, where a
+      # service of theirs and one of ours could answer to the same name.
+      - link
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # Opt-in: `docker compose --profile tunnel up -d`. A dev box reached
+    # directly by IP does not want this, and a required TUNNEL_TOKEN would
+    # otherwise block `up` for everyone.
+    profiles: [tunnel]
+    depends_on:
+      - controld
+    command: tunnel --no-autoupdate run
+    environment:
+      # Must NOT be `:?` -- compose validates interpolation for every
+      # service, including ones behind an unused profile, so a required
+      # marker here blocks `up` for people who never wanted the tunnel.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+
+networks:
+  link:
+    # A fixed name, so the other stack can join it as an external network.
+    name: ${PUKU_LINK_NETWORK:-puku-link}

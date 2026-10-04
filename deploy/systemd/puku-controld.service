@@ -1,0 +1,26 @@
+[Unit]
+Description=puku-agent-cloud control plane (API + relay)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=puku
+Group=puku
+ExecStart=/opt/puku/bin/puku-controld
+Environment=PUKU_DATABASE_URL=postgres://puku:puku@127.0.0.1:5432/puku_cloud
+Environment=PUKU_LISTEN_ADDR=0.0.0.0:7770
+Environment=PUKU_WORKER_TOKEN_FILE=/etc/puku/worker-token
+# Memory. Unset PUKU_MEMORY_URL and the platform behaves exactly as it did
+# before memory existed -- every call site degrades to no preamble. The
+# service key is read from a file rather than inlined here, like the worker
+# token: a unit file is world-readable.
+Environment=PUKU_MEMORY_URL=http://127.0.0.1:7970
+EnvironmentFile=-/etc/puku/memory.env
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

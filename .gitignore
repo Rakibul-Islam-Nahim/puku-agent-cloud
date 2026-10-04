@@ -1,0 +1,54 @@
+# Rust build output
+/target
+**/target/
+*.rs.bk
+
+# A workspace of binaries (services + CLIs) -- NOT a library -- so
+# Cargo.lock is the source of truth for every build. Commit it.
+# (Libraries would `gitignore` it; services must not.)
+!Cargo.lock
+
+# Local config & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Logs and crash dumps
+*.log
+*.log.*
+crash-*.json
+
+# Editor / OS metadata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Test / fixture artifacts
+**/*.tmp
+**/*.bak
+**/*.swp
+/coverage/
+/.cargo-cache/
+
+# Deploy / runtime scratch
+*.pid
+*.sock
+puku-archive/
+puku-volume-staging/
+
+# NOTE: images/puku-agent/vendor/ is deliberately committed -- see its README.
+
+# Local-only: the codebase walkthrough is not part of the repo docs.
+docs/CODEBASE-GUIDE.md
+
+# Local postgres / docker state (deploy/scripts write these)
+deploy/scripts/.state/
+deploy/secrets/

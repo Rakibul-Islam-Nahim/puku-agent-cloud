@@ -1,0 +1,43 @@
+[package]
+name = "puku-workerd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+puku-cloud-proto = { workspace = true }
+puku-observability = { workspace = true }
+puku-leases = { workspace = true }
+sentry = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-tungstenite = { workspace = true }
+# Only to choose rustls' crypto provider at startup: see `install_tls_provider`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+futures = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+# Object-safe async traits for the VM engine seam (`vm::VmBackend`).
+async-trait = "0.1"
+bytes = "1"
+# Verifying skill-pack digests before unpacking them into a guest.
+sha2 = "0.11.0"
+hex = "0.4.3"
+# statvfs: the free disk controld checks before placing a machine here.
+libc = "0.2"
+# Snapshot layers: compressed, then sealed in authenticated 1 MiB chunks.
+zstd = "0.13"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+microsandbox = { version = "0.6.9", default-features = false, features = ["prebuilt", "net"] }
+microsandbox-types = "0.6.9"
+
+[dev-dependencies]
+# Paused clocks, so retry/backoff tests run in no wall time.
+tokio = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,55 @@
+[package]
+name = "puku-controld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+puku-cloud-proto = { workspace = true }
+puku-observability = { workspace = true }
+puku-volume = { workspace = true }
+puku-leases = { workspace = true }
+puku-fence = { workspace = true }
+puku-snapshot = { workspace = true }
+puku-proxy = { workspace = true }
+puku-rebuild = { workspace = true }
+# tower-axum-matched-path transitively enables tower and tower-http. Without
+# it every /v1/sessions/{id}/* request becomes its own transaction name and
+# the cardinality is unbounded.
+sentry = { workspace = true, features = ["tower-axum-matched-path"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+reqwest.workspace = true
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+jsonwebtoken = "9"
+sha2 = "0.11.0"
+hex = "0.4.3"
+cron = "0.15"
+rusty-s3 = "0.10"
+chacha20poly1305 = "0.10"
+# Reverse proxy to machine ports (HTTP and WebSocket upgrades) over the
+# worker data plane. All already in the tree through axum and reqwest.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+# The integration harness drives the real /v1/worker WebSocket rather than
+# calling handlers directly, so it needs a WS client.
+tokio-tungstenite = { workspace = true }

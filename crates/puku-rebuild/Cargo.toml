@@ -1,0 +1,24 @@
+[package]
+name = "puku-rebuild"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "puku-rebuild"
+path = "src/main.rs"
+
+[lib]
+name = "puku_rebuild"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }

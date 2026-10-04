@@ -1,0 +1,12 @@
+[Unit]
+Description=Cloud Hypervisor microVMs started by puku-workerd
+Documentation=https://github.com/puku-sh/puku-agent-cloud/blob/main/docs/DEPLOYMENT.md
+Before=slices.target
+
+# Every Cloud Hypervisor VM runs as a transient unit in this slice
+# (`systemd-run --slice=puku-vms.slice`), each with its own MemoryMax. The
+# slice exists without this file; installing it is how you cap all of them
+# together, so a full box still leaves room for the host and for workerd.
+[Slice]
+#MemoryMax=90%
+TasksMax=infinity

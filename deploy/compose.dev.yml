@@ -1,0 +1,117 @@
+# Dev dependencies for puku-agent-cloud: Postgres (state + events), MinIO
+# (blob offload / archives, used from M2 on), and the memory service.
+# Usage: docker compose -f deploy/compose.dev.yml up -d
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: puku
+      POSTGRES_PASSWORD: puku
+      POSTGRES_DB: puku_cloud
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U puku -d puku_cloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The memory service owns its own database, like the skills registry does.
+  # One Postgres instance, two databases: dev convenience, not a shared schema.
+  postgres-memory:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: puku
+      POSTGRES_PASSWORD: puku
+      POSTGRES_DB: puku_memory
+    ports:
+      # 5433 is a common default and collides with other local stacks.
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - pgmemdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U puku -d puku_memory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Layered memory. Runs happily with no credentials at all.
+  #
+  # This used to say Cloudflare disabled extraction. It does not, and has not
+  # since extraction became local: Cloudflare is a replica index, and losing it
+  # costs the operator recall endpoint, not learning. Extraction and
+  # consolidation are gated on the MODEL credential.
+  #
+  # With none of them set the service still resolves profiles, records recent
+  # activity and serves pinned conventions -- a usable preamble, and the right
+  # default for a laptop. What it will not do is learn new facts or write a
+  # digest.
+  #
+  # Build context is the sibling repo, so `docker compose` must be run from a
+  # checkout that has both. Without it, unset PUKU_MEMORY_URL on controld and
+  # everything behaves exactly as it did before memory existed.
+  memory:
+    build: ../../puku-memory-service
+    depends_on:
+      postgres-memory:
+        condition: service_healthy
+    environment:
+      PUKU_MEMORY_DATABASE_URL: postgres://puku:puku@postgres-memory:5432/puku_memory?sslmode=disable
+      PUKU_MEMORY_ADDR: ":7970"
+      PUKU_MEMORY_ENV: dev
+      PUKU_MEMORY_SERVICE_KEY: dev-memory-service-key
+      PUKU_MEMORY_NAMESPACE: puku-dev
+      # A fixed dev key, so a `docker compose down` does not leave every stored
+      # credential undecryptable on the way back up. Obviously not a secret:
+      # this file is in the repository, and a real deployment supplies its own.
+      PUKU_MEMORY_SECRET_KEY: "5f0e2b9c1a47d8e36b0f9c2a8d1e4f70a3b6c9d2e5f8a1b4c7d0e3f6a9b2c5d8"
+      # Consolidation applies. Set PUKU_MEMORY_CONSOLIDATE_DRY_RUN=true to
+      # audit a deployment's proposals without letting them take effect.
+      # PUKU_CF_ACCOUNT_ID / PUKU_CF_API_TOKEN: the replica index and the
+      #   operator recall endpoint. Nothing learns or serves worse without it.
+      # PUKU_MEMORY_SECRET_KEY: encrypts the per-tenant model credentials
+      #   controld sends on ingest. Absent, none are stored and every tenant
+      #   falls through to the operator token below.
+      # PUKU_LLM_OPERATOR_TOKEN: the deployment-wide fallback (was
+      #   PUKU_LLM_TOKEN). Absent, extraction and consolidation are skipped
+      #   and auto-promotion still runs.
+    ports:
+      - "127.0.0.1:7970:7970"
+
+  # quay.io, not Docker Hub: MinIO no longer publishes minio/minio or
+  # minio/mc there, and a pull of either fails as "repository does not exist".
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: puku
+      MINIO_ROOT_PASSWORD: puku-dev-secret
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - miniodata:/data
+
+  # MinIO starts with no buckets. This makes the one controld uses for blobs,
+  # archives and machine snapshots, then exits. Point controld at it with
+  #   PUKU_R2_ENDPOINT=http://127.0.0.1:9000 PUKU_R2_BUCKET=puku-cloud
+  #   PUKU_R2_REGION=us-east-1 PUKU_R2_ACCESS_KEY_ID=puku
+  #   PUKU_R2_SECRET_ACCESS_KEY=puku-dev-secret
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 puku puku-dev-secret >/dev/null 2>&1; do sleep 1; done
+        mc mb --ignore-existing local/puku-cloud
+    restart: "no"
+
+volumes:
+  pgdata:
+  pgmemdata:
+  miniodata:

@@ -1,0 +1,17 @@
+[package]
+name = "puku-guestd"
+description = "PID 1 and host agent inside Cloud Hypervisor guests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Deliberately tiny: this binary is copied into every guest root filesystem
+# and runs as init, so it is std threads and libc, no async runtime. Build it
+# static for the guest with `--target <arch>-unknown-linux-musl`.
+[dependencies]
+puku-cloud-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+libc = "0.2"

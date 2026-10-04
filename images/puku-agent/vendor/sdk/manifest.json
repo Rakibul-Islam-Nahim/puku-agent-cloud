@@ -1,0 +1,14 @@
+{
+  "version": "1.8.39",
+  "commit": "7a94eb5f3e73b5147875aa138574c510f7b3ed26",
+  "buildDate": "2026-08-14T17:11:03.987Z",
+  "platforms": {},
+  "sdkCompat": {
+    "testedWrapperVersions": [
+      "0.1.0",
+      "0.2.0",
+      "0.3.0"
+    ],
+    "harnessSchema": 1
+  }
+}

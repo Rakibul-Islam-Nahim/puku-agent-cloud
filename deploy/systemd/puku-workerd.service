@@ -1,0 +1,64 @@
+[Unit]
+Description=puku-agent-cloud worker daemon (microVM host: libkrun and/or Cloud Hypervisor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root for M1 (microsandbox needs /dev/kvm and the state dir); a dedicated
+# user in the kvm group is the M3 hardening step.
+User=root
+ExecStartPre=/opt/puku/bin/preflight.sh
+ExecStart=/opt/puku/bin/puku-workerd
+# Stop only workerd itself, never the VMs.
+#
+# Every msb VM runs as a detached `msb sandbox` process that workerd forked,
+# and a fork stays in this unit's cgroup however hard it setsid()s. The
+# default KillMode=control-group therefore killed every running session on
+# `systemctl restart puku-workerd` -- which upgrade-box.sh does -- defeating
+# the reconcile-from-disk path that exists precisely so VMs survive a
+# workerd restart. Cloud Hypervisor VMs run in their own transient units
+# (puku-vms.slice) and are unaffected either way.
+KillMode=process
+Environment=PUKU_CONTROLD_URL=ws://127.0.0.1:7770/v1/worker
+Environment=PUKU_WORKER_NAME=%H
+Environment=PUKU_WORKER_TOKEN_FILE=/etc/puku/worker-token
+Environment=PUKU_STATE_DIR=/var/lib/puku
+# The guest image is chosen by controld (PUKU_AGENT_IMAGE there); workerd
+# never read a variable of that name, so it is not set here.
+#
+# Engines. libkrun is what every worker ran before engines existed. Cloud
+# Hypervisor is advertised only when this host passes its runtime checks
+# (see preflight.sh), so turning it on cannot attract work the box cannot run.
+Environment=PUKU_ENGINE_LIBKRUN=true
+Environment=PUKU_ENGINE_CLOUD_HYPERVISOR=false
+# Cloud Hypervisor toolchain (prestage-ch.sh) and staged guest disks
+# (build-ch-rootfs.sh). These are the defaults; set them only to move things.
+#Environment=PUKU_CH_BIN=/opt/puku/ch/bin/cloud-hypervisor
+#Environment=PUKU_CH_VIRTIOFSD=/opt/puku/ch/bin/virtiofsd
+#Environment=PUKU_CH_KERNEL=/opt/puku/ch/vmlinux
+#Environment=PUKU_CH_IMAGES_DIR=/var/lib/puku/images
+# Multi-tenant isolation floor. PUKU_EGRESS_ALLOW matches by domain suffix,
+# so `puku.sh` covers api-cli/mcp-proxy/relay; omitting it under
+# PUKU_MULTI_TENANT applies this same list rather than no policy at all.
+# PUKU_SECRET_HOSTS are the only hosts the model credential is substituted
+# into at the network boundary — the guest sees a $MSB_ placeholder.
+#Environment=PUKU_MULTI_TENANT=1
+#Environment=PUKU_EGRESS_ALLOW=puku.sh,github.com,githubusercontent.com,pypi.org,npmjs.org
+#Environment=PUKU_SECRET_HOSTS=api-cli.puku.sh
+# Pre-staged msb toolchain (see scripts/prestage-msb.sh) — no build-time
+# or first-run downloads on production hosts.
+Environment=MSB_HOME=/opt/puku/msb
+Environment=MSB_PATH=/opt/puku/msb/bin/msb
+Environment=MSB_LIBKRUNFW_PATH=/opt/puku/msb/lib/libkrunfw.so
+# Sentry, if you use it. An EnvironmentFile rather than an inline
+# Environment= line so the DSN is not readable in `systemctl cat`. The
+# leading `-` makes a missing file a no-op, which is the normal case.
+EnvironmentFile=-/etc/puku/sentry.env
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

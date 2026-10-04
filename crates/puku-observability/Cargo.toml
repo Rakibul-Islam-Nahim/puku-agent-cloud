@@ -1,0 +1,21 @@
+[package]
+name = "puku-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tracing and error reporting shared by the puku cloud binaries"
+
+[dependencies]
+sentry = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` needs test-util, which tokio's "full" does not include.
+# Without it the restart tests would sleep for real seconds.
+tokio = { workspace = true, features = ["test-util"] }
+# `test` gives with_captured_envelopes_options, which is the only way to
+# assert on what would actually leave the process.
+sentry = { workspace = true, features = ["test"] }

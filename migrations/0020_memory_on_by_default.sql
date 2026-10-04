@@ -1,0 +1,24 @@
+-- Memory on by default.
+--
+-- 0017 made it opt-in and said why: enabling it sends distilled transcript text
+-- to another service. That reasoning has not changed, so this is a product
+-- decision rather than a correction -- the operator of this deployment wants
+-- every org to have memory without an administrator turning it on per org.
+--
+-- What makes it defensible is that the off switches all still exist, and are
+-- finer-grained than this one:
+--
+--   POST /v1/memory {"enabled":false}   per org, at any time
+--   memory_opt_out on a session          per session
+--   PUKU_MEMORY_URL unset                the whole platform, exactly as before
+--
+-- And what actually leaves the box is bounded: the distiller drops oversized
+-- payloads and tool-result echoes, keeps the head and tail of a long session,
+-- and the memory service redacts again on the way in.
+--
+-- The UPDATE is the point. Changing only the default would fix new orgs and
+-- leave every existing one switched off, which is the state an operator is
+-- most likely to mistake for "memory is broken" -- controld would serve no
+-- preamble and send no ingest, silently, exactly as it did before this line.
+ALTER TABLE orgs ALTER COLUMN memory_enabled SET DEFAULT true;
+UPDATE orgs SET memory_enabled = true WHERE memory_enabled = false;

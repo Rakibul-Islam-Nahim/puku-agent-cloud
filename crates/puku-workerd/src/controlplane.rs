@@ -126,6 +126,15 @@ impl Link {
         for entry in entries.flatten() {
             let spec_path = entry.path().join("spec.json");
             let Ok(bytes) = std::fs::read(&spec_path) else { continue };
+            // A shared disk that is not mounted means the VM cannot be
+            // alive: it ran on that mount. The host rebooted, or the session
+            // was settled elsewhere while this host was gone. Reattaching
+            // would map a disk another host may now hold.
+            if self.volumes.is_shared() && !crate::volumes::is_mountpoint(&entry.path().join("disk")) {
+                tracing::info!(path = %spec_path.display(), "session disk not mounted here; not reattaching");
+                let _ = std::fs::remove_file(&spec_path);
+                continue;
+            }
             match serde_json::from_slice::<puku_cloud_proto::session::SessionSpec>(&bytes) {
                 Ok(spec) => {
                     tracing::info!(session = %spec.session_id, "reconciling session from disk");
@@ -456,6 +465,41 @@ impl Link {
             f.push(FEATURE_SHARED_VOLUMES.to_string());
         }
         f
+    }
+
+    /// Storage cleanup at startup, after the reconciles: release every
+    /// shared disk this host still has mapped but no longer runs, and drop
+    /// local session directories whose disk lives in Ceph. What a host held
+    /// when it died is cleaned up the moment it comes back.
+    pub async fn cleanup_stale_storage(&self) -> crate::volumes::StaleCleanup {
+        let mut out = crate::volumes::StaleCleanup::default();
+        let crate::volumes::SessionVolumes::Rbd(rbd) = &self.volumes else { return out };
+        let sessions = self.sessions.ids();
+        let machines = self.machines.running_ids();
+        let keep = |name: &str| {
+            if let Some(m) = name.strip_prefix("machine-") {
+                return Uuid::parse_str(m).is_ok_and(|id| machines.contains(&id));
+            }
+            Uuid::parse_str(name).is_ok_and(|id| sessions.contains(&id))
+        };
+        match rbd.release_stale(&keep).await {
+            Ok(r) => out.released = r,
+            Err(e) => tracing::error!(error = format!("{e:#}"), "releasing stale disks failed"),
+        }
+        let root = self.args.state_dir.join("sessions");
+        for id in self.on_disk_sessions() {
+            let base = root.join(id.to_string());
+            if sessions.contains(&id) || crate::volumes::is_mountpoint(&base.join("disk")) {
+                continue;
+            }
+            if std::fs::remove_dir_all(&base).is_ok() {
+                out.dirs_removed.push(id);
+            }
+        }
+        if !out.released.is_empty() || !out.dirs_removed.is_empty() {
+            tracing::info!(released = out.released.len(), dirs = out.dirs_removed.len(), "startup storage cleanup");
+        }
+        out
     }
 
     /// Every session id this worker still holds a directory for.

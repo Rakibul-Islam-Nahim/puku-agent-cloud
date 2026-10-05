@@ -45,6 +45,31 @@ pub struct Harness {
     /// The fence shared-disk moves go through, when started with
     /// `shared_volumes`.
     pub fence: Option<Arc<RecordingFence>>,
+    /// The pool the storage cleanup sees, when started with `shared_volumes`.
+    pub pool_admin: Option<Arc<FakePool>>,
+}
+
+/// An in-memory Ceph pool for the storage cleanup.
+#[derive(Default)]
+pub struct FakePool {
+    pub images: std::sync::Mutex<Vec<String>>,
+    /// Images some client has open.
+    pub open: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::storagegc::PoolAdmin for FakePool {
+    async fn list(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.images.lock().unwrap().clone())
+    }
+    async fn watchers(&self, image: &str) -> anyhow::Result<Vec<String>> {
+        let open = self.open.lock().unwrap().iter().any(|i| i == image);
+        Ok(if open { vec!["10.0.0.7:0/9".into()] } else { vec![] })
+    }
+    async fn remove(&self, image: &str) -> anyhow::Result<()> {
+        self.images.lock().unwrap().retain(|i| i != image);
+        Ok(())
+    }
 }
 
 /// A `Fence` that records what it was asked to cut off, and can be told to
@@ -163,8 +188,14 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
         Arc::new(store.unwrap().unwrap())
     });
     let fence = opts.shared_volumes.then(|| Arc::new(RecordingFence::default()));
-    let shared_volumes = fence.clone().map(|f| {
-        Arc::new(crate::sharedvol::SharedVolumes { pool: "puku-sessions".into(), fence: f })
+    let pool_admin = opts.shared_volumes.then(|| Arc::new(FakePool::default()));
+    let shared_volumes = fence.clone().zip(pool_admin.clone()).map(|(f, admin)| {
+        Arc::new(crate::sharedvol::SharedVolumes {
+            pool: "puku-sessions".into(),
+            fence: f,
+            admin,
+            gc: crate::storagegc::GcPolicy { grace: std::time::Duration::ZERO, ..Default::default() },
+        })
     });
     let state = AppState {
         // The integration harness runs without a memory service: memory is
@@ -257,6 +288,7 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
         key,
         s3: s3.map(|(store, _)| store),
         fence,
+        pool_admin,
     })
 }
 

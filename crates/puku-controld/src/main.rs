@@ -24,6 +24,7 @@ mod secretbox;
 mod skills;
 mod snapshots;
 mod sharedvol;
+mod storagegc;
 mod sweeper;
 mod triggers;
 mod workerlink;
@@ -58,6 +59,15 @@ struct Args {
     ceph_user: String,
     #[arg(long, env = "PUKU_CEPH_CONF")]
     ceph_conf: Option<String>,
+    /// Seconds between storage cleanup sweeps of the shared pool.
+    #[arg(long, env = "PUKU_STORAGE_GC_S", default_value_t = 600)]
+    storage_gc_s: u64,
+    /// How long a disk must look finished before the cleanup deletes it.
+    #[arg(long, env = "PUKU_STORAGE_GC_GRACE_S", default_value_t = 3600)]
+    storage_gc_grace_s: u64,
+    /// Log what the cleanup would delete, delete nothing.
+    #[arg(long, env = "PUKU_STORAGE_GC_DRY_RUN", default_value_t = false)]
+    storage_gc_dry_run: bool,
     #[arg(long, env = "PUKU_LISTEN_ADDR", default_value = "127.0.0.1:7770")]
     listen_addr: String,
     /// Shared secret workers present in Register. Read from
@@ -756,12 +766,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         if let Some(conf) = &args.ceph_conf {
             cfg = cfg.with_ceph_config(conf.clone());
         }
-        let volume: Arc<dyn puku_volume::VolumeBackend> = Arc::new(puku_volume::RbdBackend::new(cfg));
+        let volume: Arc<dyn puku_volume::VolumeBackend> = Arc::new(puku_volume::RbdBackend::new(cfg.clone()));
         let audit = Arc::new(fence::PgAuditSink { pool: pool.clone() });
         tracing::info!(pool = %rbd_pool, "shared session disks on; sessions move hosts after fencing");
         Arc::new(sharedvol::SharedVolumes {
             pool: rbd_pool,
             fence: fence::build_fencer(volume, audit, &instance_id.to_string()),
+            admin: Arc::new(storagegc::RbdPoolAdmin { backend: puku_volume::RbdBackend::new(cfg) }),
+            gc: storagegc::GcPolicy {
+                interval: Duration::from_secs(args.storage_gc_s.max(30)),
+                grace: Duration::from_secs(args.storage_gc_grace_s),
+                dry_run: args.storage_gc_dry_run,
+            },
         })
     });
     let state = AppState {

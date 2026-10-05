@@ -35,6 +35,9 @@ pub struct SharedVolumes {
     /// The pool every shared-volume worker keeps session images in.
     pub pool: String,
     pub fence: Arc<dyn Fence>,
+    /// Lists and deletes images for the storage cleanup (`storagegc`).
+    pub admin: Arc<dyn crate::storagegc::PoolAdmin>,
+    pub gc: crate::storagegc::GcPolicy,
 }
 
 impl SharedVolumes {

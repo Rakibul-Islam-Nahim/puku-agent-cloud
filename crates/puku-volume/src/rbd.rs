@@ -289,6 +289,11 @@ impl RbdBackend {
         Ok(vol)
     }
 
+    /// The pool session and machine images live in.
+    pub fn sessions_pool(&self) -> Result<&str, VolumeError> {
+        Ok(&self.cfg()?.pool_sessions)
+    }
+
     /// An image in the sessions pool by name (machines use `machine-<id>`).
     pub fn image(&self, name: &str) -> Result<VolumeId, VolumeError> {
         Ok(VolumeId(format!("{}/{}", self.cfg()?.pool_sessions, name)))
@@ -300,6 +305,34 @@ impl RbdBackend {
         let out = self.rbd(&["create", "--size", &size, vol.as_str()]).await?;
         if !out.success() && !out.stderr.contains("File exists") {
             return Err(Self::rejected("rbd create", &out));
+        }
+        Ok(())
+    }
+
+    /// Every image in the sessions pool, by name.
+    pub async fn list_images(&self) -> Result<Vec<String>, VolumeError> {
+        let pool = self.cfg()?.pool_sessions.clone();
+        let out = self.rbd(&["ls", "--format", "json", &pool]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd ls", &out));
+        }
+        parse_image_list(&out.stdout)
+    }
+
+    /// `(image spec, device)` for every RBD image mapped on this host.
+    pub async fn mapped(&self) -> Result<Vec<(String, String)>, VolumeError> {
+        let out = self.rbd(&["device", "list", "--format", "json"]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd device list", &out));
+        }
+        Ok(parse_device_list(&out.stdout))
+    }
+
+    /// Unmap a device even if its client is dead (blocklisted by a fence).
+    pub async fn force_unmap(&self, device: &str) -> Result<(), VolumeError> {
+        let out = self.rbd(&["device", "unmap", "-o", "force", device]).await?;
+        if !out.success() && !out.stderr.contains("not mapped") && !out.stderr.contains("No such") {
+            return Err(Self::rejected("rbd device unmap -o force", &out));
         }
         Ok(())
     }
@@ -334,6 +367,14 @@ fn first_json(text: &str, what: &str) -> Result<serde_json::Value, VolumeError> 
         .next()
         .unwrap_or(Ok(serde_json::Value::Null))
         .map_err(|e| VolumeError::Rejected(format!("{what} json: {e}")))
+}
+
+/// `rbd ls --format json` → image names.
+pub fn parse_image_list(json: &str) -> Result<Vec<String>, VolumeError> {
+    let v = first_json(json, "rbd ls")?;
+    Ok(v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default())
 }
 
 /// `rbd status --format json` → watcher addresses. Tolerates both a bare
@@ -542,6 +583,12 @@ mod tests {
             b.create(Uuid::new_v4(), &SnapId::new(VolumeId(String::new()), ""), host()).await,
             Err(VolumeError::Rejected(_))
         ));
+    }
+
+    #[test]
+    fn image_list_parses_the_real_format() {
+        assert_eq!(parse_image_list(r#"["abc","machine-x"]"#).unwrap(), vec!["abc", "machine-x"]);
+        assert!(parse_image_list("[]").unwrap().is_empty());
     }
 
     #[tokio::test]

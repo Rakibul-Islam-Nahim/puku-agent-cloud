@@ -191,11 +191,17 @@ pub fn start_sweeper(state: crate::AppState, svc: Arc<dyn LeaseService>, store: 
 pub(crate) struct SweepLock {
     conn: Option<sqlx::PgConnection>,
     held: bool,
+    key: i64,
 }
 
 impl SweepLock {
     pub(crate) fn new() -> Self {
-        Self { conn: None, held: false }
+        Self::with_key(SWEEPER_LOCK_KEY)
+    }
+
+    /// A leader lock for another single-instance job.
+    pub(crate) fn with_key(key: i64) -> Self {
+        Self { conn: None, held: false, key }
     }
 
     /// Keep the lock, or try to take it. Returns whether we hold it.
@@ -212,7 +218,7 @@ impl SweepLock {
             sqlx::query("SELECT 1").execute(&mut *conn).await.map(|_| true)
         } else {
             sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-                .bind(SWEEPER_LOCK_KEY)
+                .bind(self.key)
                 .fetch_one(&mut *conn)
                 .await
         };

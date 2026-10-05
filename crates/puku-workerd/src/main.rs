@@ -381,6 +381,8 @@ async fn run(mut args: Args) -> anyhow::Result<()> {
     // so the Register frame lists them and controld returns their cursors.
     link.reconcile_from_disk();
     link.start_machines().await;
+    // After both reconciles, so what still runs here is known.
+    link.cleanup_stale_storage().await;
     // Supervised rather than a bare loop: a panic in here severs the worker
     // from the control plane permanently, and the only symptom is sessions
     // that never get assigned.

@@ -56,6 +56,9 @@ pub fn spawn_all(state: AppState) {
     // Lease sweeper: 1 s tick per RSD §5.2.
     let store = Arc::new(PgLeaseStore { pool: state.pool.clone() });
     crate::leases::start_sweeper(state.clone(), crate::leases::service_for(&state), store);
+
+    // Storage cleanup of the shared pool: needs no worker to be up.
+    crate::storagegc::spawn(state.clone());
 }
 
 /// Tier transitions: any session in `running` whose desired_state is `stopped`

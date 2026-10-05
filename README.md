@@ -245,8 +245,18 @@ too) is one RBD image, `machine-<id>`, sized by `PUKU_RBD_MACHINE_SIZE_MIB`
 (default 40960, thin). Only an explicit destroy deletes it; a worker cleaning
 up after a machine moved away never does.
 
-Operator note: a host that was fenced and comes back still has a
-blocklisted Ceph client. **Reboot it before it rejoins.**
+**Storage cleanup** keeps the pool from filling up, and it does not depend
+on any worker being alive:
+
+| Where | When | What it removes |
+| --- | --- | --- |
+| controld (one instance, advisory lock) | every `PUKU_STORAGE_GC_S` (default 600 s) | RBD images whose session is archived or gone, or whose machine is destroyed or gone, once they have looked that way for `PUKU_STORAGE_GC_GRACE_S` (default 1 h). Never an image someone has open, never a name it does not recognise. Every delete is audited (`storage.gc.delete`). `PUKU_STORAGE_GC_DRY_RUN=true` logs instead of deleting |
+| workerd, at startup | when a host starts or comes back after being declared dead | disks it still has mapped but no longer runs (unmounted, force-unmapped: a fenced host's dead mappings), and local session folders whose disk lives in Ceph. It never reattaches a session whose disk is not mounted |
+| controld, always | every report | a report or event from a worker that no longer owns the session is ignored, and that worker is told to kill its copy |
+
+Operator note: a host that was fenced keeps a blocklisted Ceph client until
+its dead mappings are dropped; the startup cleanup does that, but rebooting a
+fenced host before it rejoins is still the safe default.
 
 ### Running the tests that need real infrastructure
 

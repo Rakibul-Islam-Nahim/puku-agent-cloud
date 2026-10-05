@@ -96,6 +96,71 @@ impl SessionVolumes {
     }
 }
 
+/// Whether `dir` is a mountpoint: a different device from its parent.
+/// Synchronous, for the restart reconcile.
+pub fn is_mountpoint(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(me), Some(parent)) = (std::fs::metadata(dir), dir.parent()) else { return false };
+        std::fs::metadata(parent).is_ok_and(|p| p.dev() != me.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// Where `device` is mounted, from `/proc/mounts`.
+fn mountpoints_of(device: &str) -> Vec<String> {
+    std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some(device)).then(|| f.next().map(str::to_string)).flatten()
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct StaleCleanup {
+    /// Images this host still had mapped but no longer runs.
+    pub released: Vec<String>,
+    /// Local session directories dropped (their disk lives in Ceph).
+    pub dirs_removed: Vec<Uuid>,
+}
+
+impl RbdVolumes {
+    /// Cleanup when this host starts (or comes back after being declared
+    /// dead): every image of our pool still mapped here that nothing here
+    /// runs is unmounted and force-unmapped. After a fence its client is
+    /// blocklisted and every write fails anyway; dropping the mapping is
+    /// what lets this host map disks again without a reboot, and frees
+    /// what it was holding. `keep` names the images still in use here.
+    pub async fn release_stale(&self, keep: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
+        let pool = self.backend.sessions_pool()?.to_string();
+        let mut released = Vec::new();
+        for (spec, dev) in self.backend.mapped().await? {
+            let Some(name) = spec.strip_prefix(&format!("{pool}/")) else { continue };
+            if keep(name) {
+                continue;
+            }
+            for mnt in mountpoints_of(&dev) {
+                // Lazy: a dead client's mount can hang a plain umount.
+                if let Err(e) = self.run_ok("umount", &["-l", &mnt]).await {
+                    tracing::warn!(%spec, %mnt, error = format!("{e:#}"), "unmounting a stale disk failed");
+                }
+            }
+            self.backend.force_unmap(&dev).await.with_context(|| format!("unmapping stale {spec}"))?;
+            tracing::warn!(%spec, %dev, "released a disk this host no longer runs");
+            released.push(spec);
+        }
+        Ok(released)
+    }
+}
+
 fn remove_dir(dir: &Path) -> Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
@@ -331,6 +396,21 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[tokio::test]
+    async fn startup_cleanup_releases_only_what_nothing_here_runs() {
+        let list = r#"[{"pool":"p","namespace":"","name":"keep-me","device":"/dev/rbd1"},
+                       {"pool":"p","namespace":"","name":"stale","device":"/dev/rbd2"},
+                       {"pool":"other","namespace":"","name":"not-ours","device":"/dev/rbd3"}]"#;
+        let runner = Arc::new(ScriptedRunner::new(vec![CmdOutput::ok(list), CmdOutput::ok("")]));
+        let backend = RbdBackend::with_runner(RbdBackendConfig::new("p", "p"), runner.clone());
+        let v = RbdVolumes { backend, size_mib: 1, runner: runner.clone() };
+        let released = v.release_stale(&|name| name == "keep-me").await.unwrap();
+        assert_eq!(released, vec!["p/stale"]);
+        let calls = runner.calls();
+        assert!(calls[1].starts_with("rbd device unmap -o force /dev/rbd2"), "{calls:?}");
+        assert_eq!(calls.len(), 2, "nothing else touched: {calls:?}");
+    }
+
     // --- Against a real Ceph cluster (PUKU_TEST_CEPH=1, root, cephx user
     // `puku`, pool `puku-sessions`). Two `noshare` backends on one machine
     // act as two hosts.
@@ -477,5 +557,34 @@ mod tests {
         // ...an explicit destroy deletes it.
         b.remove(&db, id, true).await.unwrap();
         assert_ne!(sh(&format!("rbd info puku-sessions/machine-{id} --id puku")).0, 0, "image deleted");
+    }
+
+    /// A host that died holding a disk comes back: its startup cleanup
+    /// drops the dead mapping, and the disk opens again.
+    #[tokio::test]
+    async fn real_ceph_startup_cleanup_releases_a_disk_left_mapped_by_a_crash() {
+        if !real_enabled() {
+            return;
+        }
+        let cfg = || RbdBackendConfig::new("puku-sessions", "puku-sessions").with_map_options(&["noshare"]);
+        let v = real_host();
+        let sd = state_dir("crash");
+        let sid = Uuid::new_v4();
+        let dir = v.open(&sd, sid).await.expect("open");
+        std::fs::write(dir.join("kept.txt"), "still here").unwrap();
+        assert_eq!(sh(&format!("sync -f {}", dir.display())).0, 0);
+        // Crash: no close. The restart's cleanup runs with nothing kept.
+        let rbd = RbdVolumes::new(RbdBackend::new(cfg()), 256);
+        let released = rbd.release_stale(&|_| false).await.expect("cleanup");
+        assert!(released.contains(&format!("puku-sessions/{sid}")), "{released:?}");
+        assert!(!is_mountpoint(&dir), "unmounted");
+        let (_, list) = sh("rbd device list --format json --id puku");
+        assert!(!list.contains(&sid.to_string()), "unmapped: {list}");
+        // The disk opens again, data intact, and is listed in the pool.
+        let dir = v.open(&sd, sid).await.expect("reopen");
+        assert_eq!(std::fs::read_to_string(dir.join("kept.txt")).unwrap(), "still here");
+        assert!(rbd.backend.list_images().await.unwrap().contains(&sid.to_string()));
+        v.destroy(&sd, sid).await.unwrap();
+        assert!(!rbd.backend.list_images().await.unwrap().contains(&sid.to_string()));
     }
 }

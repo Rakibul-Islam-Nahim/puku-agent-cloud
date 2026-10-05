@@ -649,6 +649,15 @@ async fn reconcile_machines(state: &AppState, worker_id: Uuid, running: &[Uuid])
     Ok(())
 }
 
+/// Whether `worker_id` is the worker the session is assigned to now.
+async fn owns_session(state: &AppState, worker_id: Uuid, session_id: Uuid) -> anyhow::Result<bool> {
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar("SELECT worker_id FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    Ok(matches!(owner, Some(Some(w)) if w == worker_id))
+}
+
 async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow::Result<()> {
     match frame {
         Up::Register { .. } => {} // only valid as first frame
@@ -666,6 +675,18 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
                 state.workers.note_capacity(worker_id, cap);
             }
             db::worker_heartbeat(&state.pool, worker_id, used_slots as i32).await?;
+        }
+        Up::SessionEvents { session_id, .. } | Up::SessionState { session_id, .. }
+            if !owns_session(state, worker_id, session_id).await? =>
+        {
+            // A worker that came back after its session was settled or moved
+            // is reporting on a copy that is no longer the session. Never let
+            // it rewrite the real one -- a "failed" from it would kill a
+            // session running fine elsewhere -- and have it stop the copy.
+            tracing::warn!(session = %session_id, %worker_id, "report from a worker that no longer owns the session; ignored");
+            if let Some(w) = state.workers.get(worker_id) {
+                w.send(Down::StopSession { session_id, mode: puku_cloud_proto::worker_proto::StopMode::Kill });
+            }
         }
         Up::SessionEvents { session_id, mut events } => {
             // Workers name blobs by key; only controld knows the bucket, so

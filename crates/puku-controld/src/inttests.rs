@@ -2373,3 +2373,112 @@ async fn a_shared_disk_machine_waits_for_a_home_that_may_be_alive() {
     assert_eq!(body["error"]["reason"], "volume_host_offline");
     assert!(h.fence.as_ref().unwrap().calls.lock().unwrap().is_empty(), "a live host is never fenced");
 }
+
+// --- Storage cleanup and stale reports --------------------------------------
+
+/// The cleanup deletes exactly the disks of finished things: archived
+/// sessions, destroyed machines, rows that no longer exist. Never a live
+/// one, never a name that is not ours, never an image still open.
+#[tokio::test]
+async fn storage_cleanup_deletes_only_finished_disks_nobody_has_open() {
+    let Some(h) = shared_harness().await else { return };
+    let mut w = FakeWorker::connect_shared_machine_worker(&h, "w-gc").await.unwrap();
+    let live = create_session(&h, serde_json::json!({"prompt": "still working"})).await;
+    let archived = create_session(&h, serde_json::json!({"prompt": "long done"})).await;
+    let archived_open = create_session(&h, serde_json::json!({"prompt": "done, but mapped"})).await;
+    sqlx::query("UPDATE sessions SET archived_at = now() WHERE id = ANY($1)")
+        .bind(vec![archived, archived_open])
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let machine = running_machine(&h, &mut w, serde_json::json!({})).await.machine_id;
+    let destroyed = running_machine(&h, &mut w, serde_json::json!({})).await.machine_id;
+    sqlx::query("UPDATE machines SET state = 'destroyed' WHERE id = $1").bind(destroyed).execute(&h.pool).await.unwrap();
+    let gone = Uuid::new_v4();
+
+    let pool = h.pool_admin.clone().unwrap();
+    *pool.images.lock().unwrap() = vec![
+        live.to_string(),
+        archived.to_string(),
+        archived_open.to_string(),
+        format!("machine-{machine}"),
+        format!("machine-{destroyed}"),
+        gone.to_string(),
+        "agent-base".into(),
+    ];
+    pool.open.lock().unwrap().push(archived_open.to_string());
+
+    let gc = crate::storagegc::StorageGc::new(pool.clone(), h.state.shared_volumes.as_ref().unwrap().gc.clone());
+    let r = gc.sweep_once(&h.pool).await.unwrap();
+    let mut deleted = r.deleted.clone();
+    deleted.sort();
+    let mut want = vec![archived.to_string(), format!("machine-{destroyed}"), gone.to_string()];
+    want.sort();
+    assert_eq!(deleted, want, "{r:?}");
+    assert_eq!(r.open, vec![archived_open.to_string()], "an open disk is never deleted");
+    let left = pool.images.lock().unwrap().clone();
+    for keep in [live.to_string(), format!("machine-{machine}"), "agent-base".into(), archived_open.to_string()] {
+        assert!(left.contains(&keep), "{keep} must survive: {left:?}");
+    }
+    let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'storage.gc.delete'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(audited, 3, "every deletion is audited");
+}
+
+/// One sweep never deletes what it sees finished for the first time, and a
+/// dry run deletes nothing at all.
+#[tokio::test]
+async fn storage_cleanup_waits_out_the_grace_and_honours_dry_run() {
+    let Some(h) = shared_harness().await else { return };
+    let pool = h.pool_admin.clone().unwrap();
+    let gone = Uuid::new_v4().to_string();
+    *pool.images.lock().unwrap() = vec![gone.clone()];
+
+    let patient = crate::storagegc::StorageGc::new(
+        pool.clone(),
+        crate::storagegc::GcPolicy { grace: std::time::Duration::from_secs(3600), ..Default::default() },
+    );
+    let r = patient.sweep_once(&h.pool).await.unwrap();
+    assert_eq!((r.deleted.len(), r.waiting.clone()), (0, vec![gone.clone()]));
+
+    let dry = crate::storagegc::StorageGc::new(
+        pool.clone(),
+        crate::storagegc::GcPolicy { grace: std::time::Duration::ZERO, dry_run: true, ..Default::default() },
+    );
+    let r = dry.sweep_once(&h.pool).await.unwrap();
+    assert_eq!(r.would_delete, vec![gone.clone()]);
+    assert_eq!(pool.images.lock().unwrap().clone(), vec![gone], "dry run deletes nothing");
+}
+
+/// A worker that comes back reporting on a session that moved on must not
+/// rewrite it -- and is told to kill its copy.
+#[tokio::test]
+async fn a_report_from_a_worker_that_lost_the_session_is_ignored() {
+    use puku_cloud_proto::worker_proto::{Down, StopMode};
+    let h = harness!();
+    let mut stale = FakeWorker::connect(&h, "w-stale", "test-worker-token").await.unwrap();
+    let id = running_session(&h, &mut stale, "work").await;
+    // The session now runs on another worker.
+    let _owner = FakeWorker::connect_machine_worker(&h, "w-new-owner").await.unwrap();
+    sqlx::query("UPDATE sessions SET worker_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(worker_id_of(&h, "w-new-owner").await)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    stale
+        .send(Up::SessionState { session_id: id, state: SessionState::Failed, error: Some("disk gone".into()), puku_session_id: None })
+        .await
+        .unwrap();
+    let killed = stale
+        .next_matching(|d| match d {
+            Down::StopSession { session_id, mode: StopMode::Kill } => Some(session_id),
+            _ => None,
+        })
+        .await;
+    assert_eq!(killed, Some(id), "the stale copy is stopped");
+    let (_, s) = h.get(&format!("/v1/sessions/{id}")).await;
+    assert_eq!(s["state"], "running", "the real session is untouched: {s}");
+}

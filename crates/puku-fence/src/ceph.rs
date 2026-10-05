@@ -239,7 +239,8 @@ mod tests {
     fn scripted_rbd(answers: Vec<puku_volume::CmdOutput>) -> Arc<puku_volume::RbdBackend> {
         let runner = Arc::new(puku_volume::ScriptedRunner::new(answers));
         Arc::new(puku_volume::RbdBackend::with_runner(
-            puku_volume::RbdBackendConfig::new("puku-base", "puku-sessions"),
+            puku_volume::RbdBackendConfig::new("puku-base", "puku-sessions")
+                .with_fence_settle(std::time::Duration::ZERO),
             runner,
         ))
     }

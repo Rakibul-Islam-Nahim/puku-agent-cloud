@@ -37,6 +37,10 @@ use crate::types::{DevicePath, HostId, SnapId, VolumeId};
 
 /// Seven days. A fenced client must never quietly regain write access.
 pub const DEFAULT_BLOCKLIST_EXPIRE_S: u64 = 7 * 24 * 3600;
+/// Wait after blocklisting before a fence is reported done (see
+/// `RbdBackendConfig::fence_settle`): over 20x the propagation delay
+/// measured on a real cluster.
+pub const DEFAULT_FENCE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Config for the real RBD backend.
 #[derive(Debug, Clone)]
@@ -57,6 +61,13 @@ pub struct RbdBackendConfig {
     pub ceph_bin: String,
     /// Seconds a fence blocklist entry lives.
     pub blocklist_expire_s: u64,
+    /// How long to wait after blocklisting before a fence counts as done.
+    /// The monitor records the entry at once, but each storage daemon only
+    /// refuses the fenced client once it has the new cluster map: measured
+    /// on a real cluster, writes still landed up to 0.2 s after the
+    /// blocklist command returned. Nothing may open the disk elsewhere
+    /// inside that window.
+    pub fence_settle: std::time::Duration,
     /// Extra `-o` options for `rbd device map` (comma-joined). Tests use
     /// `noshare` so two mappings on one machine are two Ceph clients, the
     /// way two hosts would be.
@@ -75,6 +86,7 @@ impl RbdBackendConfig {
             rbd_bin: "rbd".into(),
             ceph_bin: "ceph".into(),
             blocklist_expire_s: DEFAULT_BLOCKLIST_EXPIRE_S,
+            fence_settle: DEFAULT_FENCE_SETTLE,
             map_options: Vec::new(),
         }
     }
@@ -102,6 +114,11 @@ impl RbdBackendConfig {
 
     pub fn with_blocklist_expire(mut self, secs: u64) -> Self {
         self.blocklist_expire_s = secs;
+        self
+    }
+
+    pub fn with_fence_settle(mut self, settle: std::time::Duration) -> Self {
+        self.fence_settle = settle;
         self
     }
 }
@@ -256,6 +273,9 @@ impl RbdBackend {
                     return Err(VolumeError::Fence(format!("{addr} missing from the blocklist after adding it")));
                 }
             }
+            // Recorded is not yet enforced everywhere: let every storage
+            // daemon catch up before anyone else may open the disk.
+            tokio::time::sleep(self.cfg()?.fence_settle).await;
         }
         Ok(addrs)
     }
@@ -649,7 +669,9 @@ mod tests {
 
     fn backend(answers: Vec<CmdOutput>) -> (RbdBackend, Arc<ScriptedRunner>) {
         let runner = Arc::new(ScriptedRunner::new(answers));
-        let cfg = RbdBackendConfig::new("puku-base", "puku-sessions").with_ceph_config("/etc/ceph/ceph.conf");
+        let cfg = RbdBackendConfig::new("puku-base", "puku-sessions")
+            .with_ceph_config("/etc/ceph/ceph.conf")
+            .with_fence_settle(std::time::Duration::ZERO);
         (RbdBackend::with_runner(cfg, runner.clone()), runner)
     }
 

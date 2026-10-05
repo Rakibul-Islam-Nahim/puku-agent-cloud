@@ -218,6 +218,7 @@ impl LeaseStore for EmptyStore {
     async fn upsert(&self, _: &Lease) -> Result<(), LeaseError> { Ok(()) }
     async fn list_expiring(&self, _: chrono::DateTime<Utc>) -> Result<Vec<Lease>, LeaseError> { Ok(Vec::new()) }
     async fn list_suspected(&self) -> Result<Vec<Lease>, LeaseError> { Ok(Vec::new()) }
+    async fn count_live(&self) -> Result<usize, LeaseError> { Ok(0) }
     async fn delete(&self, _: Uuid) -> Result<(), LeaseError> { Ok(()) }
 }
 

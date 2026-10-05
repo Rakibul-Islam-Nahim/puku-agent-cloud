@@ -31,7 +31,7 @@ pub enum SnapshotTier {
     Hibernated,
     /// Cold - data is in object storage only; the RBD image has been collapsed.
     ColdArchived,
-    ///财 Archived - retained only for compliance / disaster recovery; billable.
+    /// Archived - retained only for compliance / disaster recovery; billable.
     Archived,
 }
 
@@ -55,7 +55,7 @@ pub fn spawn_all(state: AppState) {
 
     // Lease sweeper: 1 s tick per RSD §5.2.
     let store = Arc::new(PgLeaseStore { pool: state.pool.clone() });
-    crate::leases::start_sweeper(crate::leases::build_service(state.pool.clone(), "controld"), store);
+    crate::leases::start_sweeper(crate::leases::service_for(&state), store);
 }
 
 /// Tier transitions: any session in `running` whose desired_state is `stopped`
@@ -269,7 +269,7 @@ mod tests {
             SnapshotTier::ColdArchived,
             SnapshotTier::Archived,
         ];
-        //  Adjacent transitions are valid: the sweeper only ever moves  forward
+        // Adjacent transitions are valid: the sweeper only ever moves forward
         // one step. Strings are NOT compared (alphabetical order does not
         // reflect tier policy); only distinctness is asserted.
         assert_ne!(order[0], order[1]);

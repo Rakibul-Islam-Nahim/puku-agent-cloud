@@ -1847,3 +1847,155 @@ async fn a_reconnecting_worker_reconciles_its_machines() {
     let (_, m) = h.get(&format!("/v1/machines/{}", spec.machine_id)).await;
     assert!(m["error"].as_str().unwrap_or_default().contains("lost"), "{m}");
 }
+
+// --- Host liveness leases --------------------------------------------------
+
+type LeaseRow = (i64, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, bool);
+
+/// (generation, state, last_renewed_at, expires_at, expired) for a worker's lease.
+async fn lease_of(h: &Harness, worker: &str) -> Option<LeaseRow> {
+    sqlx::query_as(
+        "SELECT l.generation, l.state, l.last_renewed_at, l.expires_at, l.expires_at <= now() \
+         FROM leases l JOIN workers w ON w.id = l.host_id WHERE w.name = $1",
+    )
+    .bind(worker)
+    .fetch_optional(&h.pool)
+    .await
+    .unwrap()
+}
+
+async fn until_workers_gone(h: &Harness) {
+    for _ in 0..200 {
+        if h.state.workers.is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("worker never left the registry");
+}
+
+#[tokio::test]
+async fn a_lease_worker_is_given_a_lease_that_its_frames_renew() {
+    let h = harness!();
+    let mut w = FakeWorker::connect_lease_worker(&h, "w-lease").await.unwrap();
+    let (gen, state, first, _, _) = lease_of(&h, "w-lease").await.expect("lease taken over on register");
+    assert_eq!((gen, state.as_str()), (1, "held"));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    w.send(Up::LeaseRenew).await.unwrap();
+    for _ in 0..100 {
+        let (g, _, renewed, _, _) = lease_of(&h, "w-lease").await.unwrap();
+        if renewed > first {
+            assert_eq!(g, 1, "renewal keeps the generation");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the renew frame never reached the lease row");
+}
+
+#[tokio::test]
+async fn a_dropped_link_expires_the_lease_at_once_and_a_reconnect_takes_it_over() {
+    let h = harness!();
+    let w = FakeWorker::connect_lease_worker(&h, "w-drop").await.unwrap();
+    drop(w);
+    until_workers_gone(&h).await;
+    // Expired now, not after the 3 s TTL: the next sweep suspects it.
+    let (_, state, _, _, expired) = lease_of(&h, "w-drop").await.unwrap();
+    assert_eq!(state, "held");
+    assert!(expired, "a dropped link must expire the lease immediately");
+
+    let _w = FakeWorker::connect_lease_worker(&h, "w-drop").await.unwrap();
+    let (gen, state, _, _, expired) = lease_of(&h, "w-drop").await.unwrap();
+    assert_eq!((gen, state.as_str(), expired), (2, "held", false), "a new generation per registration");
+}
+
+#[tokio::test]
+async fn a_worker_without_the_lease_feature_has_no_lease() {
+    let h = harness!();
+    let _w = FakeWorker::connect_machine_worker(&h, "w-old").await.unwrap();
+    assert!(lease_of(&h, "w-old").await.is_none(), "nobody renews it, so nobody may declare it dead");
+}
+
+/// The sweeper's whole path against Postgres: suspected, then dead, with
+/// both timestamps persisted, and a dead host shut out until it re-registers.
+#[tokio::test]
+async fn the_sweeper_suspects_then_declares_dead_and_persists_both() {
+    use puku_leases::{LeaseError, LeaseService, LeaseServiceImpl, LeaseSweeper};
+    let h = harness!();
+    let store = std::sync::Arc::new(crate::leases::PgLeaseStore { pool: h.pool.clone() });
+    let svc = std::sync::Arc::new(LeaseServiceImpl::new(store.clone(), "controld-a"));
+    let bmc = std::sync::Arc::new(puku_leases::bmc_probe::BmcProbeStub);
+    let sweeper = LeaseSweeper::new(store.clone(), svc.clone(), bmc);
+    let mut hosts = Vec::new();
+    for _ in 0..4 {
+        let id = Uuid::new_v4();
+        svc.takeover(id, "controld-a").await.unwrap();
+        hosts.push(id);
+    }
+    let dead = hosts[0];
+    let lease = svc.lookup(dead).await.unwrap().unwrap();
+
+    sqlx::query("UPDATE leases SET expires_at = now() - interval '4 seconds' WHERE host_id = $1")
+        .bind(dead)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let r = sweeper.sweep_once().await.unwrap();
+    assert_eq!(r.newly_suspected, vec![dead]);
+    assert!(r.newly_dead.is_empty());
+    let (state, suspected): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT state, suspected_at FROM leases WHERE host_id = $1")
+            .bind(dead)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "suspected");
+    assert!(suspected.is_some(), "suspected_at is persisted");
+
+    sqlx::query("UPDATE leases SET suspected_at = now() - interval '20 seconds' WHERE host_id = $1")
+        .bind(dead)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let r = sweeper.sweep_once().await.unwrap();
+    assert_eq!(r.newly_dead, vec![dead]);
+    let (state, confirmed): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT state, confirmed_dead_at FROM leases WHERE host_id = $1")
+            .bind(dead)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "released");
+    assert!(confirmed.is_some(), "confirmed_dead_at is persisted");
+
+    assert!(matches!(svc.renew(&lease).await, Err(LeaseError::Dead(_))), "a dead host cannot just renew");
+    let back = svc.takeover(dead, "controld-a").await.unwrap();
+    assert_eq!(back.generation, lease.generation + 1);
+    let (state, suspected, confirmed): (String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT state, suspected_at, confirmed_dead_at FROM leases WHERE host_id = $1")
+            .bind(dead)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!((state.as_str(), suspected, confirmed), ("held", None, None));
+}
+
+/// Two controld instances: only one sweeps, and when it goes away the
+/// other takes over.
+#[tokio::test]
+async fn only_one_instance_holds_the_sweeper_lock() {
+    let h = harness!();
+    let mut a = crate::leases::SweepLock::new();
+    let mut b = crate::leases::SweepLock::new();
+    assert!(a.hold(&h.pool).await, "first instance takes the lock");
+    assert!(a.hold(&h.pool).await, "and keeps it");
+    assert!(!b.hold(&h.pool).await, "second instance does not sweep");
+    drop(a); // the instance dies; its session closes
+    for _ in 0..100 {
+        if b.hold(&h.pool).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the lock never passed to the surviving instance");
+}

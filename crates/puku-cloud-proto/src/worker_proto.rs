@@ -18,6 +18,12 @@ use crate::snapshot::{Consistency, Fingerprint, PartDone, PartUrl, SnapshotLayer
 /// data plane (`crate::data_proto`).
 pub const FEATURE_MACHINES: &str = "machines";
 
+/// Feature name a worker advertises when it sends `Up::LeaseRenew` every
+/// second. Controld takes over the host's liveness lease on registration
+/// and renews it on each frame; a worker without the feature has no lease
+/// and is never declared dead by the sweeper.
+pub const FEATURE_LEASE: &str = "lease";
+
 /// What a worker's host has, for the placement decisions controld makes
 /// before it assigns anything: whether a machine could *ever* fit here, and
 /// whether its image is staged. Every field is optional, and a field a
@@ -132,6 +138,10 @@ pub enum Up {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<HostReport>,
     },
+    /// "Still alive", once a second, from a worker that advertised
+    /// `FEATURE_LEASE`. Kept separate from `Heartbeat` (every 10 s, carries
+    /// inventory) so liveness is cheap and frequent.
+    LeaseRenew,
     SessionEvents {
         session_id: Uuid,
         events: Vec<GuestEvent>,
@@ -465,6 +475,13 @@ mod compat_tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert!(!json.contains("engines") && !json.contains("features"), "{json}");
         assert!(!json.contains("machines") && !json.contains("host"), "{json}");
+    }
+
+    #[test]
+    fn lease_renew_is_a_bare_tag() {
+        let json = serde_json::to_string(&Up::LeaseRenew).unwrap();
+        assert_eq!(json, r#"{"type":"lease_renew"}"#);
+        assert!(matches!(serde_json::from_str::<Up>(&json).unwrap(), Up::LeaseRenew));
     }
 
     /// Heartbeats and machine reports from before hosts reported limits.

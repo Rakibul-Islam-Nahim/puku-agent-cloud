@@ -457,6 +457,7 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
         .await
         .unwrap_or_default();
 
+    let wants_lease = features.iter().any(|f| f == puku_cloud_proto::worker_proto::FEATURE_LEASE);
     let (tx, mut rx) = mpsc::unbounded_channel::<Down>();
     let handle = WorkerHandle {
         worker_id,
@@ -473,6 +474,25 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
     };
     state.workers.insert(handle);
     tracing::info!(worker = %worker_name, %worker_id, engines = ?engine_names, "worker online");
+
+    // The host is talking to us, so whatever its lease row says, it is
+    // alive: take the lease over under a new generation. A worker that
+    // sends no renewals gets no lease row at all, so the sweeper never
+    // declares it dead on the strength of a row nobody renews.
+    let leases = crate::leases::service_for(&state);
+    let mut lease = if wants_lease {
+        match leases.takeover(worker_id, &state.cfg.instance_id.to_string()).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::error!(worker = %worker_name, error = %e, "lease takeover failed");
+                None
+            }
+        }
+    } else {
+        let store = crate::leases::PgLeaseStore { pool: state.pool.clone() };
+        let _ = puku_leases::LeaseStore::delete(&store, worker_id).await;
+        None
+    };
 
     // Of what the worker still has on disk, tell it which are already
     // archived. Reaping at archival time only reaches a worker that happens
@@ -554,12 +574,33 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
                 continue;
             }
         };
+        if matches!(frame, Up::LeaseRenew) {
+            let Some(held) = lease.as_ref() else { continue };
+            match leases.renew(held).await {
+                Ok(next) => lease = Some(next),
+                // Declared dead while the link was up (renewals stalled past
+                // the grace period), or the host re-registered on another
+                // link. Either way this link is stale: drop it, and the
+                // worker reconnects under a new generation.
+                Err(e @ (puku_leases::LeaseError::Dead(_) | puku_leases::LeaseError::NotHeld)) => {
+                    tracing::warn!(worker = %worker_name, error = %e, "lease lost on a live link; dropping it");
+                    lease = None;
+                    break;
+                }
+                Err(e) => tracing::warn!(worker = %worker_name, error = %e, "lease renew failed"),
+            }
+            continue;
+        }
         if let Err(e) = handle_up_frame(&state, worker_id, frame).await {
             tracing::error!(error = %e, "handling worker frame failed");
         }
     }
 
     tracing::info!(worker = %worker_name, "worker disconnected");
+    if let Some(held) = lease.as_ref() {
+        // Suspect it on the next sweep, not after the TTL.
+        let _ = leases.expire_now(held).await;
+    }
     state.workers.remove(worker_id);
     state.data.forget(worker_id);
     let _ = db::worker_offline(&state.pool, worker_id).await;
@@ -611,6 +652,7 @@ async fn reconcile_machines(state: &AppState, worker_id: Uuid, running: &[Uuid])
 async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow::Result<()> {
     match frame {
         Up::Register { .. } => {} // only valid as first frame
+        Up::LeaseRenew => {} // handled on the link, which owns the lease
         Up::Heartbeat { used_slots, capacity_slots, sandboxes, host } => {
             state.workers.note_sandboxes(worker_id, sandboxes);
             if let Some(host) = host {

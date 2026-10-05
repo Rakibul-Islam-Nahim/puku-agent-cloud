@@ -1,42 +1,32 @@
-//! Lease service: 1–2 s heartbeat, expiry sweeper.
+//! Host liveness leases. Per docs/RELIABILITY-REBUILD.md §4.2, with the
+//! review corrections:
 //!
-//! Per docs/RELIABILITY-REBUILD.md §4.2.
-//!
-//! ## Worker-side contract
-//!
-//! ```rust,ignore
-//! loop {
-//!     lease_service.renew(&lease).await?;
-//!     tokio::time::sleep(Duration::from_secs(1)).await;
-//! }
-//! ```
-//!
-//! If `renew` fails (controld unreachable, advisory lock contention), the
-//! worker MUST:
-//!  1. log `lease_lost` with `host_id`
-//!  2. set its VMs to read-only (snap a snapshot, then stop writing)
-//!  3. continue trying; if N=3 consecutive failures, self-shutdown the VMs
+//! - **The worker never stops its own VMs.** It sends a renew frame every
+//!   second on its existing control link; controld renews the lease. If the
+//!   link or the control plane is down, the worker keeps running: a
+//!   control-plane outage must not become a data-plane outage. Stopping a
+//!   host's writes is the storage fence's job, and only controld orders it.
+//! - **Two thresholds.** Missed renewals make a host *suspected* after the
+//!   TTL (3 s): no new work. It is declared *dead* only after a further
+//!   grace period (15 s by default), and never during a mass loss.
+//! - **Generation per takeover.** Each registration starts a new
+//!   generation; a host that comes back after being declared dead must
+//!   re-register before it can run anything.
 //!
 //! ## Sweeper contract
 //!
-//! The control plane runs the sweeper every 1 s:
-//!
-//! ```rust,ignore
-//! for lease in leases WHERE state = 'held' AND expires_at < now() {
-//!     mark_suspected(lease.host_id).await?;
-//!     // Optionally probe BMC to confirm death.
-//!     // If BMC unreachable for > 2 probe attempts -> mark confirmed dead.
-//! }
-//! ```
+//! One controld instance at a time (Postgres advisory lock) runs
+//! [`LeaseSweeper::sweep_once`] every second and acts on its
+//! [`SweepReport`]: suspected hosts get no placements, dead hosts have their
+//! sessions recovered after fencing, a mass-loss hold pages an operator.
 
 pub mod bmc_probe;
-pub mod heartbeat;
 pub mod sweeper;
 pub mod types;
 
 pub use bmc_probe::BmcProbe;
-pub use heartbeat::Heartbeat;
-pub use sweeper::LeaseSweeper;
+pub use sweeper::{LeaseSweeper, MassLoss, SweepPolicy, SweepReport};
 pub use types::{
-    BmcEndpoint, BmcKind, Lease, LeaseError, LeaseService, LeaseServiceImpl, LeaseState, LeaseStore,
+    BmcEndpoint, BmcKind, InMemoryLeaseStore, Lease, LeaseError, LeaseService, LeaseServiceImpl, LeaseState,
+    LeaseStore, LEASE_TTL_SECONDS,
 };

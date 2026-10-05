@@ -216,6 +216,7 @@ impl Link {
             engines: self.backends.engines(),
             features: vec![
                 puku_cloud_proto::worker_proto::FEATURE_MACHINES.to_string(),
+                puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
                 puku_cloud_proto::snapshot::FEATURE_SNAPSHOTS.to_string(),
             ],
             running_machines: self.machines.running_ids(),
@@ -264,9 +265,18 @@ impl Link {
             .expect("up_rx missing: run_once called concurrently");
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        // Liveness, separate from the inventory heartbeat. Missing ticks
+        // only ever costs this host its new placements and, much later, its
+        // sessions -- never its running VMs: the worker does not stop
+        // anything on its own when the link is down.
+        let mut lease = tokio::time::interval(Duration::from_secs(1));
+        lease.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let result: Result<()> = async {
             loop {
                 tokio::select! {
+                    _ = lease.tick() => {
+                        sink.send(Message::Text(serde_json::to_string(&Up::LeaseRenew)?.into())).await?;
+                    }
                     _ = heartbeat.tick() => {
                         // Ground truth from the host, not from our own
                         // bookkeeping: the point of reporting this is to

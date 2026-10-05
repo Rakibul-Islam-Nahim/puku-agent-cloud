@@ -1,7 +1,6 @@
 mod controlplane;
 mod datalink;
 mod gitpush;
-mod heartbeat;
 mod hostcap;
 mod idle;
 mod machines;

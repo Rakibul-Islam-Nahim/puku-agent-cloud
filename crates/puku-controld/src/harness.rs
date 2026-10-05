@@ -392,6 +392,16 @@ impl FakeWorker {
         Self::connect_worker_with(h, name, capacity_slots, host, features).await
     }
 
+    /// A machines worker that keeps a liveness lease (`FEATURE_LEASE`).
+    /// It renews only when the test sends `Up::LeaseRenew`.
+    pub async fn connect_lease_worker(h: &Harness, name: &str) -> Result<Self> {
+        let features = vec![
+            puku_cloud_proto::worker_proto::FEATURE_MACHINES.to_string(),
+            puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
+        ];
+        Self::connect_worker_with(h, name, 8, None, features).await
+    }
+
     /// A worker that runs machines and snapshots them.
     pub async fn connect_snapshot_worker(h: &Harness, name: &str) -> Result<Self> {
         let features = vec![

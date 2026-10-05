@@ -187,7 +187,7 @@ The table in §6 predates the code: most of the crates it lists now exist. This 
 | Area | State | Proof |
 |---|---|---|
 | RBD volumes (`puku-volume/src/rbd.rs`) | Real: clone, `map --exclusive`, unmap, snapshot, watcher fencing; every `rbd`/`ceph` failure surfaces | `tests/real_ceph.rs` against MicroCeph (`PUKU_TEST_CEPH=1`), plus scripted unit tests |
-| Fencing (`puku-fence`) | Per-volume Ceph blocklist with audit; a failed fence fails the call | Unit tests; real blocklist proven by `real_ceph.rs`. BMC (IPMI/Redfish) not exercised: needs hardware |
+| Fencing (`puku-fence`) | Per-volume Ceph blocklist with audit; a failed fence fails the call | Unit tests; real blocklist proven by `real_ceph.rs` (with a 5 s settle after the blocklist, found by that test). BMC power-off (IPMI/Redfish) is a placeholder: `ipmi.rs`/`redfish.rs` record the action but send nothing, and nothing calls them |
 | Recovery ordering (`controld/recovery.rs`) | Fence before any remote restore; failed fence stops recovery | Unit tests |
 | Host leases (`puku-leases`, `controld/leases.rs`, workerlink) | Worker sends `LeaseRenew` every 1 s; controld takes over on register (new generation), renews, expires on disconnect. Worker never stops its own VMs | Unit tests + controld integration tests on Postgres |
 | Lease sweeper | One instance at a time (advisory lock). Suspect at 3 s TTL, dead 15 s later, mass-loss hold above 30 % of 3+ hosts | Unit tests + Postgres integration tests (incl. lock handover) |
@@ -202,6 +202,7 @@ The table in §6 predates the code: most of the crates it lists now exist. This 
 
 **Not done yet, in order:**
 
+1. Power-off fencing through IPMI/Redfish: write the real calls (today a placeholder) and test on servers with a management port.
 1. Desired-state on stop.
 2. Auto-resume of a session that was waiting for an answer (today it waits for the answer).
 3. Nahim's `puku-proxy` (client reconnect proxy) and `puku-rebuild` (replay installed packages): compiled and unit-tested, not wired. Shared disks keep installed packages, so `puku-rebuild` matters only for host-local disks.

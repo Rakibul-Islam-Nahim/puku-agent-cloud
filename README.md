@@ -171,7 +171,7 @@ section 4. The pieces, and what each needs:
 | --- | --- | --- |
 | Host leases | notices a dead worker host in ~18 s and settles its work | nothing (on by default) |
 | Shared disks | session and machine disks on Ceph RBD, so work can move hosts | Ceph + `PUKU_RBD_POOL` |
-| Fencing | cuts a dead host off a disk before anyone else opens it | Ceph user with `osd blocklist` |
+| Fencing | cuts a dead host off a disk before anyone else opens it (blocklist, then a 5 s wait until every storage daemon enforces it) | Ceph user with `osd blocklist` |
 | VM watchdog | restarts a VM that died or hung on a healthy host | nothing (on by default) |
 | Storage cleanup | deletes finished disks even when their host is down | shared disks |
 | Off-cluster backups | hourly encrypted backups; rebuilds a disk the pool lost | shared disks + object storage + `PUKU_SECRET_KEY` |

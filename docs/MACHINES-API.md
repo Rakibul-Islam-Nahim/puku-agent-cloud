@@ -279,7 +279,7 @@ Response `200`:
 ## Snapshots
 
 A snapshot is a machine's disks in object storage (MinIO in development,
-Cloudflare R2 in production; any S3-compatible store), so the machine can be
+our own MinIO in production; any S3-compatible store), so the machine can be
 restored on **any** worker, at the size it had, after the worker holding its
 volume is gone.
 
@@ -397,7 +397,7 @@ of the machine now. Otherwise a destroyed machine's snapshots are kept for
 | `PUKU_LINKS_SECRET` | derived from `PUKU_SECRET_KEY` | HMAC key for capabilities |
 | `PUKU_MACHINE_IDLE_SWEEP_S` | `30` | How often idle machines are checked |
 | `PUKU_SNAPSHOTS` | `auto` | `auto` offers snapshots when object storage (`PUKU_R2_*`) and `PUKU_SECRET_KEY` are both set; `true` refuses to start without them; `false` never offers them |
-| `PUKU_SNAPSHOT_PART_MIB` | `64` | Multipart part size. Every part but the last is exactly this big, which R2 requires |
+| `PUKU_SNAPSHOT_PART_MIB` | `64` | Multipart part size. Every part but the last is exactly this big, which some S3 stores require |
 | `PUKU_SNAPSHOT_KEEP` | `5` | Ready snapshots kept per machine that sets no `keep` of its own |
 | `PUKU_SNAPSHOT_RETAIN_DESTROYED_DAYS` | `7` | How long a destroyed machine's snapshots are kept |
 | `PUKU_SNAPSHOT_SWEEP_S` | `60` | How often periodic snapshots, retention and deletion run |

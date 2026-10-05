@@ -93,7 +93,8 @@ never a real one.
 ### 2. One box (dev or single host)
 
 **Dependencies.** Postgres, plus MinIO if you want artifacts, archives and
-machine snapshots (it stands in for Cloudflare R2 or any S3 API):
+machine snapshots and disk backups. MinIO on our own server is the object storage, in development and in
+production; no outside cloud is used. The settings keep the `PUKU_R2_*` names from the original code; they work with any S3-compatible store, and in our setup they point at our own MinIO.
 
 ```sh
 docker compose -f deploy/compose.dev.yml up -d postgres minio minio-init
@@ -271,7 +272,7 @@ message; one waiting for an answer is only stopped). A third crash within 30
 minutes stops the automatic restarts and the reason says so.
 
 **Off-cluster disk backups.** Ceph's three copies cover a lost drive or host,
-not a lost pool. With shared disks, object storage (`PUKU_R2_*`) and
+not a lost pool. With shared disks, object storage (our MinIO, set with `PUKU_R2_*`) and
 `PUKU_SECRET_KEY` all set, one controld backs up every shared disk each
 `PUKU_DISK_BACKUP_INTERVAL_S` (default 3600): an RBD snapshot, then a full
 `rbd export` the first time (and after 24 diffs) or an `rbd export-diff` of
@@ -601,7 +602,7 @@ the Linux/KVM box.
   ceiling — `--god-mode` is no longer hardcoded); the question protocol is
   the real one (`--permission-prompt-tool stdio` + `control_response`, see
   [`docs/PUKU-CLI-CONTRACT.md`](docs/PUKU-CLI-CONTRACT.md)); oversized event
-  payloads are uploaded to R2 instead of dangling; sessions get titles;
+  payloads are uploaded to object storage instead of dangling; sessions get titles;
   workers authenticate with per-worker tokens; the monthly budget is
   enforced mid-run, not only at create; `/health` and `/metrics` exist; and
   CI builds, lints and tests on every PR.
@@ -641,7 +642,7 @@ the Linux/KVM box.
   Cloudflare tunnel next to Postgres, the same shape as
   `puku-chat-compute-service`. workerd stays a systemd unit — it needs
   `/dev/kvm` and the msb toolchain on the host.
-- Object storage (Cloudflare R2 or any S3 API) holds spilled event payloads
+- Object storage (our own MinIO; the settings keep the `PUKU_R2_*` names from the original code; they work with any S3-compatible store, and in our setup they point at our own MinIO) holds spilled event payloads
   and archived transcripts. **Credentials live only on controld**; workers
   request a short-lived presigned PUT over the control link, so no worker
   ever holds a bucket key.

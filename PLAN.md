@@ -37,7 +37,7 @@ The RSD is the deliverable. This section records *what has been decided in it* s
 | Conversation | Always recoverable | Transcript is permanent in Postgres; `session_events` partitioned log |
 | Split-brain | Impossible | Fence (Ceph blocklist + BMC) always before any cross-host relocate |
 | RTO | < 2 s local / < 30 s host-loss / < 15 min region-loss | See F1–F9 in RSD §1 |
-| Whole-Ceph-pool loss | ≤ `disk_backup_interval` of writes (default 1 h) | Off-cluster backup to R2 (RSD §4.7) |
+| Whole-Ceph-pool loss | ≤ `disk_backup_interval` of writes (default 1 h) | Off-cluster backup to object storage, our own MinIO (RSD §4.7) |
 | Recovery mode | `warm_allowed` (default) or `cold_only` (per-session opt-down) | Per-org ceiling, per-session row, DB CHECK enforces best-effort is always cold |
 
 ### 2.2 Failure-mode coverage (RSD §1)
@@ -49,7 +49,7 @@ The RSD is the deliverable. This section records *what has been decided in it* s
 ```
 Pending       → visibility-only, NEVER restorable
 LocalDurable  → fsynced on origin NVMe, local restore only
-Durable       → verified off-host copy (RADOS hot pool, or R2 when off)
+Durable       → verified off-host copy (RADOS hot pool, or object storage (MinIO) when off)
 Corrupt       → sha256 mismatch, never restorable
 ```
 
@@ -73,12 +73,12 @@ This 3-state (plus Corrupt) replaces the old binary "durable / not". It is load-
 | What it stores | Current base + diffs after it, for every warm session |
 | Eviction | Only after (a) not referenced and (b) `cold_copied_at` set |
 | Premium gate | `POST /v1/sessions` returns `409 premium_requires_hot_pool` when disabled or unhealthy |
-| Fallback | Captures still complete as `LocalDurable`; remote restore uses R2; `HotPoolUnavailable` alert fires; premium SLA broken until fixed |
+| Fallback | Captures still complete as `LocalDurable`; remote restore uses object storage (MinIO); `HotPoolUnavailable` alert fires; premium SLA broken until fixed |
 
 ### 2.6 Off-cluster disk backup (RSD §4.7)
 
-- `rbd export` (full) or `rbd export-diff --from-snap` (incremental) to R2.
-- Empty diffs skipped (idle sessions don't waste R2 IO).
+- `rbd export` (full) or `rbd export-diff --from-snap` (incremental) to object storage (our MinIO).
+- Empty diffs skipped (idle sessions don't waste storage IO).
 - Compaction at 24 diffs OR on first backup after `archived`.
 - Restore = `rbd import` (full) + `rbd import-diff` (chain), sha256 verified at every step.
 - `disk_backup_interval_s` defaults to 3600; `last_disk_backup_at` on `sessions`; `DiskBackupStale` alert at 2× interval.
@@ -116,7 +116,7 @@ running / waiting_input  → hibernated   (idle > idle_timeout_s, desired=runnin
 hibernated               → cold_archived (now - snapshot_taken_at > cold_after_days)
                               move RBD to rbd-cold (EC k=4 m=2)
 cold_archived            → archived      (now - snapshot_taken_at > archive_after_days)
-                              export disk to R2 first, sha256 in R2; delete RBD
+                              export disk to object storage first, sha256 stored; delete RBD
 any                      → deleted       (ONLY on explicit DELETE; transcript kept forever)
 ```
 
@@ -140,7 +140,7 @@ Alerts (RSD §8.3, **9 rows**): `LeaseExpiredLong`, `FenceFailed`, `SnapshotVeri
 | Snapshot status model (3-state + Corrupt) | RSD §4.4.1 | **Done in spec** |
 | Compaction mechanic (overlay merge, re-parenting, FK RESTRICT) | RSD §4.4.4 | **Done in spec** |
 | Hot pool design (`puku-snap-hot`, 3 replicas, premium gate) | RSD §4.4.3a | **Done in spec** |
-| Off-cluster disk backup design (full + diff to R2, 24-diff compaction) | RSD §4.7 | **Done in spec** |
+| Off-cluster disk backup design (full + diff to object storage, 24-diff compaction) | RSD §4.7 | **Done in spec** |
 | Recovery-mode gating function `effective_recovery_mode()` | RSD §4.4.3 | **Done in spec** |
 | `besteffort_is_cold` DB CHECK constraint | RSD §3.1 | **Done in spec** |
 | `rpo_at_risk` column + cron job + alert | RSD §3.1, §4.4.3, §8.3 | **Done in spec** |
@@ -336,15 +336,15 @@ The phases are gated. **You cannot start R4 (warm resume) without R0's engine nu
 |---|---|---|
 | 24 | `crates/puku-controld/src/archive.rs` (extend) | Tier transition table (RSD §7) |
 | 25 | `crates/puku-controld/src/api/mod.rs` (complete) | `/resume` accepts `archived` and long-polls |
-| 42 | `tests/chaos/T9_no_silent_delete.rs` | 30-day mocked → `cold_archived` not `archived`; R2 archive sha256 present |
+| 42 | `tests/chaos/T9_no_silent_delete.rs` | 30-day mocked → `cold_archived` not `archived`; object-storage archive sha256 present |
 | 49 | `crates/puku-guestd/src/package_watcher.rs` | inotify on `/var/lib/dpkg/status`, pip dist-info, npm cache |
 | 51 | `crates/puku-rebuild/src/main.rs` | Emits shell script from `installed_packages` |
 | 54 | `tests/chaos/T11_recover_from_hibernated.rs` | `hibernated` → `running` within 30 s, RBD attached, mem snap restored |
-| 55 | `tests/chaos/T12_recover_from_archived.rs` | `archived` → download R2 archive, sha256 verify, fresh clone, apply manifest |
+| 55 | `tests/chaos/T12_recover_from_archived.rs` | `archived` → download the archive from object storage, sha256 verify, fresh clone, apply manifest |
 | 58 | `tests/chaos/T15_cold_resume.rs` | `cold_only` + `apt install jq` + SIGKILL → package still there, no rollback |
 | 59 | `tests/chaos/T16_rebuild_from_packages.rs` | Fresh base + replayed installs = same env |
 | 60 | `migrations/0032_disk_backups.sql` | `disk_backups` table + `last_disk_backup_at` + `disk_backup_interval_s` |
-| 61 | `crates/puku-snapshot/src/disk_backup.rs` (if not in R4) | `rbd export`/`export-diff` to R2, 24-diff compaction |
+| 61 | `crates/puku-snapshot/src/disk_backup.rs` (if not in R4) | `rbd export`/`export-diff` to object storage, 24-diff compaction |
 | 62 | `tests/chaos/T17_ceph_pool_loss_restore.rs` | Delete RBD image → `FromArchive`; files + packages present |
 
 **Acceptance check.** All five chaos tests pass. `AC19` verified (off-cluster disk backup restores after RBD loss).

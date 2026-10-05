@@ -1,5 +1,9 @@
 # Puku Agent Cloud — Reliability Rebuild Plan
 
+> **Final project note.** Wherever this design says **R2**, the final project uses **MinIO on our own server**
+> (the code speaks the S3 API; its settings keep the `PUKU_R2_*` names). No Cloudflare or other outside cloud
+> is used. What was built from this design, and how it was tested, is in `PLAN.md` section 4.
+
 > **Scope of this document.** Reliability only. A complete build spec for turning the current repo into a system that meets the "100% recoverable" promise from the Notion design. Scalability, time efficiency, and storage efficiency are explicitly out of scope and addressed in follow-on docs.
 >
 > **Audience.** The engineer reading this is the one writing the code. Every section is one "what to do" + "how to know it's done" pair.

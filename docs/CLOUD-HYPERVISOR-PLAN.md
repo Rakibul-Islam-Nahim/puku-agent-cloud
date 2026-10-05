@@ -400,7 +400,7 @@ Bulk bytes never go over the JSON control socket, whose channel is unbounded and
 | `POST /{id}/start` \| `/stop` \| `/touch` | `start` is pinned to `volume_worker_id`. If that worker is offline past a grace period, the machine is re-placed with `resumed=false`. |
 | `POST /{id}/exec` | Returns `{stdout, stderr, code}`. A timeout returns 124. Output is capped. |
 | `GET\|PUT /{id}/files?path=&mode=list\|read&max_bytes=` | Raw bytes; `mode` applies on write. |
-| `GET\|PUT /{id}/archive?path=&exclude=` | Streamed tar. Above about 90 MB (the Cloudflare body limit), switch to R2 through the existing `RequestUpload` flow. |
+| `GET\|PUT /{id}/archive?path=&exclude=` | Streamed tar. Above about 90 MB (the Cloudflare body limit), switch to object storage (MinIO) through the existing `RequestUpload` flow. |
 | `ANY /{id}/ports/{port}/{*path}` | HTTP and WebSocket proxy, restricted to the ports in `expose`. |
 | `POST /{id}/screens {view_port, control_port, policy, ttl}` | Returns `https://<screens-host>/v1/screens/{cap}/embed.html?...`. The capability is an HMAC over `(machine, ports, policy, exp)` and sits **in the path**, because the puku-bot proxy drops the query string on asset requests. |
 

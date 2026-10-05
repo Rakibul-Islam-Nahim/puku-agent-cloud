@@ -49,16 +49,16 @@ flowchart LR
     VM["microVM per session<br/>puku-cli headless"]
   end
 
-  R2[("R2 / S3<br/>packs + transcripts")]
+  OBJ[("MinIO (S3 API)<br/>packs + transcripts")]
 
   CLI -->|"HTTP :7770"| CD
   CD -->|"resolve packs :7870"| SK
   SK --> PG2
-  SK --> R2
+  SK --> OBJ
   CD --> PG1
   CD -->|"WebSocket — worker dials out"| WD
   WD -->|boot| VM
-  WD -->|"download + verify digest"| R2
+  WD -->|"download + verify digest"| OBJ
 ```
 
 | Piece | Port | Runs as |
@@ -145,20 +145,15 @@ skills, scheduled ones get none.
 
 ## Step 3 — object storage
 
-You need two S3-compatible buckets. Cloudflare R2 is what the config
-assumes; any S3 API works.
+Object storage is **MinIO on our own server**: no outside cloud. You need two
+buckets in it. The settings keep the `PUKU_R2_*` names from the original code; they work with any S3-compatible store, and in our setup they point at our own MinIO.
 
 | Bucket | Holds |
 | --- | --- |
 | `puku-agent-cloud` | Session transcripts, spilled event payloads, deliverables |
 | `puku-skills` | Pack tarballs, content-addressed by sha256 |
 
-Create both, then mint an access key pair with read/write on them. Note the
-**account-scoped endpoint** — `https://<account-id>.r2.cloudflarestorage.com`,
-not the per-bucket URL. Using the bucket URL is the most common setup error
-and shows up much later as a 403 on a download.
-
-### Using MinIO instead (dev)
+### Running MinIO
 
 ```bash
 docker run -d --name minio --restart unless-stopped \
@@ -188,12 +183,11 @@ docker run --rm --network host --entrypoint sh quay.io/minio/mc -c "
   mc ls local"
 ```
 
-Three settings differ from R2 and each fails unhelpfully if you get it
-wrong:
+Three settings each fail unhelpfully if you get them wrong:
 
 | Setting | Value | Why |
 | --- | --- | --- |
-| `PUKU_R2_REGION` | **`us-east-1`** | MinIO's default. `auto` is R2-only, and SigV4 signs the region, so a mismatch surfaces as a signature error rather than a region error |
+| `PUKU_R2_REGION` | **`us-east-1`** | MinIO's default. SigV4 signs the region, so a mismatch surfaces as a signature error rather than a region error |
 | `PUKU_R2_ENDPOINT` | **`http://<box-ip>:9000`** | Not `127.0.0.1` and not `172.17.0.1`. Presigned URLs are handed to **your laptop** for `puku cloud pull`, so the host in them must be one your laptop can reach. A container-only address makes uploads work and downloads 404 |
 | port 9000 | reachable from your laptop | Same reason — the laptop follows a 302 there |
 
@@ -211,11 +205,10 @@ what they need.
 - **Size the bucket for homes, not transcripts.** A desktop machine's volume
   is gigabytes, uploaded compressed in 64 MiB parts on every stop that changed
   something. Keep `PUKU_SNAPSHOT_KEEP` small.
-- **R2:** every part but the last must be the same size, which controld
-  guarantees. Add a lifecycle rule that aborts incomplete multipart uploads
-  after a day; controld also aborts any capture still open after six hours.
 - **MinIO:** the same bucket and the same three settings as above. In
   development, `deploy/compose.dev.yml`'s `minio-init` creates the bucket.
+  Add a lifecycle rule that aborts incomplete multipart uploads after a day;
+  controld also aborts any capture still open after six hours.
 - **Keep `PUKU_SECRET_KEY`.** Every snapshot's data key is sealed with it:
   lose or change it and every snapshot becomes unreadable.
 
@@ -242,9 +235,9 @@ BIND_ADDR=0.0.0.0                      # 127.0.0.1 if using the SSH tunnel
 CLOUDFLARE_TUNNEL_TOKEN=               # leave blank in dev
 PUKU_API_URL=https://chat.api.puku.sh  # REQUIRED: controld forwards user bearers here
 PUKU_SKILLS_OPERATOR_TOKEN=<the generated token>
-PUKU_R2_ENDPOINT=http://103.174.50.75:9000     # MinIO; or the R2 account URL
+PUKU_R2_ENDPOINT=http://103.174.50.75:9000     # our MinIO
 PUKU_R2_BUCKET=puku-skills
-PUKU_R2_REGION=us-east-1                       # 'auto' for R2
+PUKU_R2_REGION=us-east-1                       # MinIO's region
 PUKU_R2_ACCESS_KEY_ID=<key>
 PUKU_R2_SECRET_ACCESS_KEY=<secret>
 PUKU_SKILLS_SEED_DIR=/opt/puku/skills
@@ -272,7 +265,7 @@ curl -fsS -H "Authorization: Bearer $PUKU_SKILLS_OPERATOR_TOKEN" \
 ```
 
 11 skills total. If the list is empty, the seeder failed — check the log for
-a storage error, which is where a wrong R2 key surfaces here.
+a storage error, which is where a wrong MinIO key surfaces here.
 
 ## Step 5 — control plane
 
@@ -302,9 +295,9 @@ PUKU_SECRET_KEY=<the generated key>
 PUKU_SKILLS_URL=http://172.17.0.1:7870      # the docker bridge, see note
 PUKU_SKILLS_TOKEN=<same as PUKU_SKILLS_OPERATOR_TOKEN>
 
-PUKU_R2_ENDPOINT=http://103.174.50.75:9000     # MinIO; or the R2 account URL
+PUKU_R2_ENDPOINT=http://103.174.50.75:9000     # our MinIO
 PUKU_R2_BUCKET=puku-agent-cloud
-PUKU_R2_REGION=us-east-1                       # 'auto' for R2
+PUKU_R2_REGION=us-east-1                       # MinIO's region
 PUKU_R2_ACCESS_KEY_ID=<key>
 PUKU_R2_SECRET_ACCESS_KEY=<secret>
 
@@ -588,7 +581,7 @@ All four must be right:
 
 - `object_storage: true` alone means only that a bucket is **configured**.
 - **`object_storage_probe: "ok"`** is the one that proves the credentials
-  work. Anything else is your R2 key or bucket, quoted verbatim.
+  work. Anything else is your MinIO key or bucket, quoted verbatim.
 - `workers_connected: 1` — if 0, see Step 7's URL note.
 
 Then run the free half of the deployment test:
@@ -847,7 +840,7 @@ key. Access also fronts the API, so scripted calls then need a service token.
 whatever is in `PUKU_R2_ENDPOINT` must resolve *there*. Tunnel the control
 plane, firewall the box, and uploads keep working while downloads fail —
 which reads as a storage bug and is not one. Either keep the storage port
-reachable, give it its own hostname, or use real R2.
+reachable, or give it its own hostname.
 
 ### Two-level subdomains need their own certificate
 
@@ -1140,7 +1133,7 @@ Found in testing, none blocking, all worth knowing before 2am.
 | `pukud cloud ls` 401 | Wrong `pkc_` key, or `PUKU_AUTH` mismatch |
 | `unknown command 'cloud'` | Global 1.8.49; build the branch (Step 9) |
 | `workers_connected: 0` | Usually `PUKU_CONTROLD_URL` is a base URL instead of `ws://…/v1/worker`. The worker only logs `connecting to controld` |
-| `object_storage_probe` not `"ok"` | Wrong R2 key/secret, missing bucket, or the endpoint set to the bucket URL rather than the account URL |
+| `object_storage_probe` not `"ok"` | Wrong MinIO key/secret, missing bucket, or an endpoint controld cannot reach |
 | Session fails at boot with `Not authorized … index.docker.io` | The image is in Docker but not in msb. `docker save <tag> \| msb load -t <tag>`, then `msb image list` to confirm |
 | Guest runs OLD code after a rebuild, no error anywhere | Two causes, both silent. Either the build never reached msb (`msb load` onto an existing tag prints `✓ Loaded` and keeps the old image — `msb image rm` first), or you retagged workerd's `PUKU_AGENT_IMAGE` instead of the one controld dispatches. `deploy/scripts/deploy-guest-image.sh` handles both |
 | Session stuck at `booting` | Worker cannot pull the guest image, or no KVM |

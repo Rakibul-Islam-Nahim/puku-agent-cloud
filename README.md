@@ -17,7 +17,7 @@ terminal. Design doc: [`../AGENT-CLOUD-DESIGN.md`](../AGENT-CLOUD-DESIGN.md).
 | `crates/puku-leases` | Host liveness leases and the sweeper (suspect, dead, mass-loss guard) |
 | `crates/puku-volume` | Volume backends: Ceph RBD (map, exclusive lock, fence by blocklist) and local |
 | `crates/puku-fence` | Fencing with an audit trail (`fence_log`): Ceph blocklist, IPMI/Redfish hooks |
-| `crates/puku-snapshot`, `puku-proxy`, `puku-rebuild` | Snapshot model and restore ladder, reconnect proxy, environment rebuild (see `PLAN.md` for state) |
+| `crates/puku-snapshot`, `puku-proxy`, `puku-rebuild` | Designed, not wired in yet: snapshot model and restore plan, reconnect proxy, environment rebuild. The snapshots and disk backups that run today are controld's own (`snapshots.rs`, `diskbackup.rs`) |
 | `crates/puku-cloud-cli` | `puku-cloud` client: `run / ls / attach / answer / input / interrupt / stop / resume / cancel` |
 | `migrations/` | sqlx migrations (applied automatically by controld at startup) |
 | `images/puku-agent/` | Guest OCI image + `puku-runner` in-guest supervisor |

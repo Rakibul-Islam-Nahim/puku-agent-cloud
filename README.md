@@ -200,7 +200,8 @@ The worker never stops its own VMs when it loses controld, so a
 control-plane outage is not a data-plane outage. Only one controld instance
 sweeps at a time (Postgres advisory lock); run as many as you like.
 
-**Shared session disks: opt-in, needs Ceph.** Without this, a session's
+**Shared disks on Ceph: required for production.** The software starts without
+them (a laptop or a quick test), but then a session's
 files live on the worker that ran it, and if that host dies the session can
 only fail after a 15-minute grace. With it, each session has its own RBD
 image, and a session whose host died continues on another host, after

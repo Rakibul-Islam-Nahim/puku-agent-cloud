@@ -11,12 +11,16 @@
 //!   they are stopped, saying why; a start then waits for the host until the
 //!   volume grace runs out, as it always has. A machine that was stopping
 //!   is simply stopped.
-//! - **Sessions** keep their workspace on that host's disk and nowhere
-//!   else, so they cannot move. A running one is stopped -- resumable, and a
-//!   resume goes back to the host if it returns, or fails with a reason once
-//!   it has been gone past the grace period. One that was still booting is
-//!   failed (resumable too). One the host was handed but never started goes
-//!   back in the queue.
+//! - **Sessions on a shared disk** that were mid-turn are resumed at once:
+//!   stopped, then queued again with a "continue where you left off"
+//!   message, as if the user had typed it. The dispatcher fences the dead
+//!   host off the disk and places the session on another host. One that was
+//!   waiting for an answer is only stopped; the answer resumes it.
+//! - **Sessions on a host-local disk** cannot move. A running one is
+//!   stopped -- resumable, and a resume goes back to the host if it returns,
+//!   or fails with a reason once it has been gone past the grace period.
+//! - Either kind still booting is failed (resumable too). One the host was
+//!   handed but never started goes back in the queue.
 //!
 //! Fencing. Sessions on shared disks (`sharedvol`) are fenced when they
 //! are next placed, not here: the fence goes with the move, and a session
@@ -42,6 +46,8 @@ pub struct HostLossReport {
     pub sessions_stopped: Vec<Uuid>,
     pub sessions_failed: Vec<Uuid>,
     pub sessions_requeued: Vec<Uuid>,
+    /// Shared-disk sessions that were mid-turn, queued to continue elsewhere.
+    pub sessions_resumed: Vec<Uuid>,
     /// Set when the host turned out to be connected here after all, and
     /// nothing was touched.
     pub skipped_connected: bool,
@@ -75,6 +81,7 @@ pub async fn on_host_dead(state: &AppState, host: Uuid) -> anyhow::Result<HostLo
             "sessions_stopped": report.sessions_stopped,
             "sessions_failed": report.sessions_failed,
             "sessions_requeued": report.sessions_requeued,
+            "sessions_resumed": report.sessions_resumed,
             "fence": "on move: shared-disk sessions are fenced when next placed",
         }),
     )
@@ -85,7 +92,7 @@ pub async fn on_host_dead(state: &AppState, host: Uuid) -> anyhow::Result<HostLo
     if !report.machines_restored.is_empty() {
         crate::api::machines::dispatch_machines(state).await?;
     }
-    if !report.sessions_requeued.is_empty() {
+    if !report.sessions_requeued.is_empty() || !report.sessions_resumed.is_empty() {
         crate::api::dispatch_pending(state).await?;
     }
     Ok(report)
@@ -156,7 +163,7 @@ async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossRepo
             _ if shared => (
                 SessionState::Stopped,
                 "the worker host running this session was lost; its disk is on shared storage, \
-                 so a resume continues on another host once the old one is fenced",
+                 so it continues on another host once the old one is fenced",
             ),
             _ => (
                 SessionState::Stopped,
@@ -171,6 +178,14 @@ async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossRepo
                 }
                 if next == SessionState::Failed {
                     report.sessions_failed.push(id);
+                } else if shared && cur == SessionState::Running && state.shared_volumes.is_some() {
+                    match resume_elsewhere(state, id).await {
+                        Ok(()) => report.sessions_resumed.push(id),
+                        Err(e) => {
+                            tracing::warn!(session = %id, error = format!("{e:#}"), "auto-resume failed; left stopped");
+                            report.sessions_stopped.push(id);
+                        }
+                    }
                 } else {
                     report.sessions_stopped.push(id);
                 }
@@ -179,5 +194,38 @@ async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossRepo
             Err(e) => tracing::info!(session = %id, error = %e, "dead-host session already moved on"),
         }
     }
+    Ok(())
+}
+
+/// What a session resumed after its host died is told. Its disk is intact up
+/// to the last flush, but the turn was cut off: the agent should look before
+/// it assumes.
+pub const CONTINUE_PROMPT: &str = "The machine running this session failed in the middle of your task, and the \
+session was moved to another machine with its files intact. Continue the task from where you left off. \
+Check the current state of the workspace first: the last few seconds of work before the failure may not \
+have been saved.";
+
+/// Queue a stopped shared-disk session again, as a resume would. A session
+/// that already has a conversation continues it with `CONTINUE_PROMPT`; one
+/// whose agent never got going keeps its original prompt and starts over on
+/// the same disk.
+async fn resume_elsewhere(state: &AppState, id: Uuid) -> anyhow::Result<()> {
+    let has_conversation: bool =
+        sqlx::query_scalar("SELECT puku_session_id IS NOT NULL FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    sqlx::query("UPDATE sessions SET worker_id = NULL WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    let prompt = has_conversation.then_some(CONTINUE_PROMPT);
+    let (_, ev) = db::transition_with_prompt(&state.pool, id, SessionState::Scheduled, None, prompt).await?;
+    if let Some(ev) = ev {
+        state.publish_events(&[ev]).await;
+    }
+    db::audit(&state.pool, None, None, "session.auto_resume", &id.to_string(), serde_json::json!({"reason": "host_dead"}))
+        .await
+        .ok();
     Ok(())
 }

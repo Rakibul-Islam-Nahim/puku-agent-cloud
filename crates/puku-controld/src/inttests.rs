@@ -2265,3 +2265,55 @@ async fn a_shared_disk_session_never_moves_to_a_host_local_worker() {
     assert_eq!(status, 202);
     local.assert_no_assignment(std::time::Duration::from_secs(1)).await;
 }
+
+/// A shared-disk session mid-turn on a host declared dead continues on
+/// another host by itself, told what happened, after the fence.
+#[tokio::test]
+async fn a_mid_turn_shared_disk_session_continues_elsewhere_on_its_own() {
+    let Some(h) = shared_harness().await else { return };
+    let mut a = FakeWorker::connect_shared_worker(&h, "w-auto-dies").await.unwrap();
+    let id = create_session(&h, serde_json::json!({"prompt": "build the report"})).await;
+    a.next_assignment().await.expect("assigned");
+    for st in [SessionState::Booting, SessionState::Bootstrapping, SessionState::Running] {
+        let psid = (st == SessionState::Running).then(|| format!("cli-{id}"));
+        a.send(Up::SessionState { session_id: id, state: st, error: None, puku_session_id: psid }).await.unwrap();
+    }
+    h.await_state(id, &["running"]).await;
+    let dead = worker_id_of(&h, "w-auto-dies").await;
+    drop(a);
+    until_workers_gone(&h).await;
+    sqlx::query("UPDATE leases SET state = 'released' WHERE host_id = $1").bind(dead).execute(&h.pool).await.unwrap();
+    let mut b = FakeWorker::connect_shared_worker(&h, "w-auto-new").await.unwrap();
+
+    let report = crate::hostloss::on_host_dead(&h.state, dead).await.unwrap();
+    assert_eq!(report.sessions_resumed, vec![id], "{report:?}");
+    let spec = b.next_assignment().await.expect("continues on the survivor");
+    assert_eq!(spec.session_id, id);
+    assert!(spec.resume, "the same conversation, not a new one");
+    assert_eq!(spec.prompt, crate::hostloss::CONTINUE_PROMPT);
+    let calls = h.fence.as_ref().unwrap().calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "fenced before it moved: {calls:?}");
+    assert_eq!(calls[0].0, dead);
+}
+
+/// One that was waiting for the user's answer is stopped, not resumed: the
+/// answer is what continues it.
+#[tokio::test]
+async fn a_shared_disk_session_waiting_for_an_answer_is_only_stopped() {
+    let Some(h) = shared_harness().await else { return };
+    let mut a = FakeWorker::connect_shared_worker(&h, "w-ask-dies").await.unwrap();
+    let id = running_session(&h, &mut a, "ask me first").await;
+    a.send(Up::SessionState { session_id: id, state: SessionState::WaitingInput, error: None, puku_session_id: None })
+        .await
+        .unwrap();
+    h.await_state(id, &["waiting_input"]).await;
+    let dead = worker_id_of(&h, "w-ask-dies").await;
+    drop(a);
+    until_workers_gone(&h).await;
+    sqlx::query("UPDATE leases SET state = 'released' WHERE host_id = $1").bind(dead).execute(&h.pool).await.unwrap();
+
+    let report = crate::hostloss::on_host_dead(&h.state, dead).await.unwrap();
+    assert_eq!(report.sessions_stopped, vec![id]);
+    assert!(report.sessions_resumed.is_empty());
+    h.await_state(id, &["stopped"]).await;
+}

@@ -14,6 +14,10 @@ terminal. Design doc: [`../AGENT-CLOUD-DESIGN.md`](../AGENT-CLOUD-DESIGN.md).
 | `crates/puku-controld` | Control plane: REST API, client attach relay, worker WebSocket link, Postgres persistence |
 | `crates/puku-workerd` | Per-host worker daemon; one microVM per session or machine, on libkrun (microsandbox SDK) and/or Cloud Hypervisor |
 | `crates/puku-guestd` | Init and host agent inside Cloud Hypervisor guests (vsock: exec, ports, shutdown) |
+| `crates/puku-leases` | Host liveness leases and the sweeper (suspect, dead, mass-loss guard) |
+| `crates/puku-volume` | Volume backends: Ceph RBD (map, exclusive lock, fence by blocklist) and local |
+| `crates/puku-fence` | Fencing with an audit trail (`fence_log`): Ceph blocklist, IPMI/Redfish hooks |
+| `crates/puku-snapshot`, `puku-proxy`, `puku-rebuild` | Snapshot model and restore ladder, reconnect proxy, environment rebuild (see `PLAN.md` for state) |
 | `crates/puku-cloud-cli` | `puku-cloud` client: `run / ls / attach / answer / input / interrupt / stop / resume / cancel` |
 | `migrations/` | sqlx migrations (applied automatically by controld at startup) |
 | `images/puku-agent/` | Guest OCI image + `puku-runner` in-guest supervisor |
@@ -33,32 +37,123 @@ terminal. Design doc: [`../AGENT-CLOUD-DESIGN.md`](../AGENT-CLOUD-DESIGN.md).
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component diagrams: the platform, controld, the skills registry, and where telemetry goes |
 | [`docs/SEQUENCE-FLOWS.md`](docs/SEQUENCE-FLOWS.md) | Sequence diagrams for each session flow |
 | [`skills/deployment-test/`](skills/deployment-test/) | An agent skill that runs the test sequence for you |
+| [`docs/RELIABILITY-REBUILD.md`](docs/RELIABILITY-REBUILD.md) | The reliability design: leases, fencing, shared disks, snapshots, recovery |
+| [`PLAN.md`](PLAN.md) | Reliability work tracker; section 4 is what is built and tested |
 | [`docs/SDK-MIGRATION-PLAN.md`](docs/SDK-MIGRATION-PLAN.md) | Driving the guest agent with `puku-agent-sdk` — compatibility findings, what is built, and the gate before it becomes the default |
 
-## Quick start (dev, macOS Apple Silicon or Linux/KVM)
+## Setup
+
+Three ways to run it, from smallest to the real thing. Each builds on the
+one before. The full bare-metal walkthrough, with secrets, tunnel, guest
+images and a paid test sequence, is [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md);
+this section is the map and the parts that guide does not cover.
+
+| Goal | You need | Section |
+| --- | --- | --- |
+| Build, run every test | Linux or macOS, Rust, Docker (or a local Postgres) | [1](#1-build-and-test) |
+| One box running real sessions | Linux with `/dev/kvm`, Postgres, the guest image | [2](#2-one-box-dev-or-single-host) |
+| Sessions that survive a dead host | 2+ worker hosts, a Ceph cluster | [3](#3-reliability-host-leases-and-shared-session-disks) |
+
+### Prerequisites
+
+| What | Why | Install |
+| --- | --- | --- |
+| Rust stable (edition 2021) | builds everything | `curl https://sh.rustup.rs -sSf \| sh` |
+| `build-essential pkg-config libssl-dev libcap-ng-dev` (Linux) | workerd links the microsandbox SDK, which needs `libcap-ng` | `sudo apt-get install -y build-essential pkg-config libssl-dev libcap-ng-dev` |
+| Postgres 16+ | all state; migrations run on controld startup | `docker compose -f deploy/compose.dev.yml up -d postgres`, or a local server |
+| Linux + `/dev/kvm` | **workers only**: every session is a microVM | bare metal or nested virt; check with `ls -l /dev/kvm` |
+| Docker | building the guest image; dev Postgres/MinIO | docker.com |
+| Node 20 | only the runner test in CI | nodejs.org |
+| `ceph-common` (`rbd`, `ceph`) | only for shared session disks (section 3) | `sudo apt-get install -y ceph-common` |
+
+controld itself runs anywhere (it is also shipped as a container, see
+`Dockerfile`). Only workerd needs KVM.
+
+### 1. Build and test
 
 ```sh
-docker compose -f deploy/compose.dev.yml up -d postgres
+git clone https://github.com/Rakibul-Islam-Nahim/puku-agent-cloud && cd puku-agent-cloud
 cargo build --workspace
 
-# control plane
-PUKU_AI_API_KEY=... ./target/debug/puku-controld &
+# unit tests: no database, no KVM
+cargo test --workspace
 
-# worker (same or another machine)
-PUKU_STATE_DIR=$HOME/.puku-cloud ./target/debug/puku-workerd &
-
-# run a session
-./target/debug/puku-cloud run "fix the failing test in ..." --repo https://github.com/you/repo
+# integration tests: a real controld + a fake worker over the real
+# worker protocol, against Postgres. They SKIP without this variable.
+docker compose -f deploy/compose.dev.yml up -d postgres
+docker compose -f deploy/compose.dev.yml exec postgres createdb -U puku puku_test
+PUKU_TEST_DATABASE_URL=postgres://puku:puku@127.0.0.1:5432/puku_test cargo test --workspace
 ```
 
-The guest image must exist first: `docker build -t puku-agent images/puku-agent`
-(verify the puku-cli install line matches how puku-cli is actually
-distributed), then push it somewhere the worker's registry access can reach
-and set `PUKU_AGENT_IMAGE`.
+The integration suite creates a schema per test, so many run in parallel
+against one database; give that Postgres `max_connections` of a few hundred
+if you see "too many clients". Use a database the suite may drop schemas in,
+never a real one.
 
-### Stub smoke test (no puku-cli needed)
+### 2. One box (dev or single host)
 
-Prove the whole pipeline with a stock image and a fake runner:
+**Dependencies.** Postgres, plus MinIO if you want artifacts, archives and
+machine snapshots (it stands in for Cloudflare R2 or any S3 API):
+
+```sh
+docker compose -f deploy/compose.dev.yml up -d postgres minio minio-init
+```
+
+**Guest image.** Build it, and load it where the worker's msb can see it
+(see "Load them into msb" in `docs/DEPLOYMENT.md`, step 6):
+
+```sh
+docker build -t puku-agent images/puku-agent
+```
+
+**Control plane.** Defaults: listens on `127.0.0.1:7770`, database
+`postgres://puku:puku@127.0.0.1:5432/puku_cloud`, auth off (every request is
+the dev org).
+
+```sh
+export PUKU_AGENT_IMAGE=puku-agent:latest
+export PUKU_AI_API_KEY=...                  # operator model key, dev only
+export PUKU_ALLOW_OPERATOR_CREDENTIALS=true # allow that key to reach guests
+export PUKU_SECRET_KEY=$(openssl rand -hex 32)   # encrypts credentials at rest
+# optional object storage (MinIO from the compose file):
+export PUKU_R2_ENDPOINT=http://127.0.0.1:9000 PUKU_R2_BUCKET=puku-cloud \
+       PUKU_R2_REGION=us-east-1 PUKU_R2_ACCESS_KEY_ID=puku PUKU_R2_SECRET_ACCESS_KEY=puku-dev-secret
+./target/debug/puku-controld
+```
+
+**Worker** (same box or another; it dials out to controld, nothing listens):
+
+```sh
+# one token per host, printed once:
+./target/debug/puku-controld gen-worker-token --name box-1 > /tmp/worker-token
+
+sudo PUKU_CONTROLD_URL=ws://127.0.0.1:7770/v1/worker \
+     PUKU_WORKER_NAME=box-1 PUKU_WORKER_TOKEN_FILE=/tmp/worker-token \
+     PUKU_STATE_DIR=/var/lib/puku \
+     ./target/debug/puku-workerd
+```
+
+Production hosts use the systemd units and scripts instead:
+`deploy/scripts/prestage-msb.sh` (stage the VM toolchain so nothing
+downloads at runtime), `deploy/scripts/setup-worker.sh`,
+`deploy/systemd/puku-workerd.service`, and `deploy/scripts/preflight.sh`
+(refuses to start on a host that cannot run VMs).
+
+**Run a session:**
+
+```sh
+./target/debug/puku-cloud run "fix the failing test in src/auth" --repo https://github.com/you/repo
+./target/debug/puku-cloud ls
+./target/debug/puku-cloud attach <session-id>
+```
+
+The client reads `PUKU_CLOUD_URL` (default `http://127.0.0.1:7770`) and
+`PUKU_CLOUD_API_KEY`. With `PUKU_AUTH=required`, mint a key:
+`./target/debug/puku-controld gen-key --org dev --name me`.
+
+**Stub smoke test** (no puku-cli, no model, no money): proves
+controld → worker → VM → events → client with a stock image and a fake
+runner.
 
 ```sh
 PUKU_AGENT_IMAGE=alpine ./target/debug/puku-controld &
@@ -66,6 +161,93 @@ PUKU_RUNNER_CMD='echo "{\"type\":\"result\",\"subtype\":\"success\",\"total_cost
   ./target/debug/puku-workerd &
 ./target/debug/puku-cloud run "smoke"
 ```
+
+### 3. Reliability: host leases and shared session disks
+
+Two independent pieces (design: `docs/RELIABILITY-REBUILD.md`; what is
+built and tested: `PLAN.md` section 4).
+
+**Host leases: on by default, nothing to configure.** Every worker sends
+a small "alive" frame each second; controld keeps one lease per host in
+Postgres:
+
+| After the host goes silent | What controld does |
+| --- | --- |
+| 3 s | *suspected*: no new work goes there |
+| 15 s more | *dead*: its machines restart elsewhere from their latest snapshot (or stop, if they have none); its sessions are stopped, resumable; work it never started is requeued |
+| more than 30 % of 3+ hosts silent at once | declares nobody dead and logs `MASS HOST LOSS` (likely the network, not the hosts) |
+
+The worker never stops its own VMs when it loses controld, so a
+control-plane outage is not a data-plane outage. Only one controld instance
+sweeps at a time (Postgres advisory lock); run as many as you like.
+
+**Shared session disks: opt-in, needs Ceph.** Without this, a session's
+files live on the worker that ran it, and if that host dies the session can
+only fail after a 15-minute grace. With it, each session has its own RBD
+image, and a session whose host died continues on another host, after
+controld has fenced the old host off its disk.
+
+1. **On the Ceph cluster**, once: a pool, and a cephx user that may map RBD
+   images and blocklist clients (the fence):
+
+   ```sh
+   ceph osd pool create puku-sessions 32
+   ceph osd pool application enable puku-sessions rbd
+   rbd pool init puku-sessions
+   ceph auth get-or-create client.puku \
+     mon 'profile rbd, allow command "osd blocklist"' \
+     osd 'profile rbd pool=puku-sessions' \
+     -o /etc/ceph/ceph.client.puku.keyring
+   ```
+
+2. **On every worker host:** `ceph-common`, `/etc/ceph/ceph.conf` and that
+   keyring, the `rbd` kernel module (`deploy/scripts/prestage-rbd.sh`
+   checks), then:
+
+   ```sh
+   PUKU_RBD_POOL=puku-sessions      # turns it on; same pool on every worker
+   PUKU_CEPH_USER=puku              # default
+   PUKU_CEPH_CONF=/etc/ceph/ceph.conf
+   PUKU_RBD_SIZE_MIB=20480          # per session, thin-provisioned (default)
+   ```
+
+   workerd must run as root (it maps, formats and mounts the images). A
+   session's disk is mounted at `$PUKU_STATE_DIR/sessions/<id>/disk` only
+   while it runs there, mapped `--exclusive` so no second host can open it,
+   and released when it stops.
+
+3. **On controld:** the same three variables (`PUKU_RBD_POOL`,
+   `PUKU_CEPH_USER`, `PUKU_CEPH_CONF`), plus `ceph-common` and the keyring
+   on the controld host: controld is what runs the fence.
+
+How a resume chooses its host:
+
+| The host the session last ran on | Result |
+| --- | --- |
+| connected | goes back there (no fence) |
+| declared dead by its lease | old host fenced off the disk (`fence_log`), then any shared-disk worker |
+| away, not yet declared dead | waits: fencing a live host would cut every disk it has open |
+| fence fails | stays queued: never two writers |
+
+Operator note: a host that was fenced and comes back still has a
+blocklisted Ceph client. **Reboot it before it rejoins.** Machines (the
+generic-VM API) still keep their volumes on the host; they move by snapshot
+restore (needs object storage and `PUKU_SECRET_KEY`).
+
+### Running the tests that need real infrastructure
+
+| Suite | Needs | Command |
+| --- | --- | --- |
+| Unit | nothing | `cargo test --workspace` |
+| controld integration (~220 tests) | Postgres | `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` |
+| RBD fencing on real Ceph | Ceph, root, user `client.puku`, pools `puku-base` (with protected `agent-base@v1`) and `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-volume --test real_ceph` |
+| Session disks moving between hosts on real Ceph | Ceph, root, pool `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-workerd real_ceph -- --test-threads=1` |
+
+A single-node test Ceph works (MicroCeph: `snap install microceph`,
+`microceph cluster bootstrap`, `microceph disk add loop,4G,3`). Use the
+distribution's `/usr/bin/rbd` from `ceph-common`, not the snap's: the snap's
+confinement blocks it from mapping devices. The Ceph tests run
+two "hosts" on one machine with `noshare` mappings.
 
 ## Skills and connectors
 
@@ -136,10 +318,8 @@ the live session list, and a fleet panel showing each worker's sandboxes
 plus anything that has drifted out of step. `GET /v1/fleet` is the same data
 as JSON.
 
-Tests: `cargo test --workspace` runs everything, but the integration suite
-(`crates/puku-controld/src/inttests.rs` — a real controld and a real worker
-socket) only runs when `PUKU_TEST_DATABASE_URL` points at a database it may
-create schemas in. CI sets it and fails if those tests silently skip.
+Tests: see [Running the tests that need real infrastructure](#running-the-tests-that-need-real-infrastructure).
+CI sets `PUKU_TEST_DATABASE_URL` and fails if the integration tests silently skip.
 
 ## Architecture
 
@@ -260,7 +440,9 @@ puku account, not the operator's.
 
 1. `POST /v1/sessions` → row in Postgres (`created`) → dispatcher assigns an
    online worker (`scheduled`) and sends the spec down the worker WebSocket.
-2. workerd creates `/var/lib/puku/sessions/<id>/{session,workspace}`, writes
+2. workerd creates `/var/lib/puku/sessions/<id>/{session,workspace}` (on a
+   shared-disk worker: inside the session's RBD image, mounted at
+   `sessions/<id>/disk`), writes
    `manifest.json`, boots a microVM with both dirs bind-mounted
    (`booting → bootstrapping`), and execs `puku-runner` in the guest
    (`running`).
@@ -332,6 +514,13 @@ the Linux/KVM box.
   live fanout via Postgres LISTEN/NOTIFY (verified with two controld
   instances), image pre-pull on worker startup. Warm memory-snapshot pools
   remain future work (microsandbox snapshots are disk-only today).
+
+- **Reliability rebuild: in progress (branch `mahi`).** Host leases with a
+  single-leader sweeper and mass-loss guard; a dead host's machines and
+  sessions settled automatically; session disks on Ceph RBD that move to
+  another host after the old one is fenced. Tested against Postgres and a
+  real Ceph cluster; multi-host chaos runs and BMC fencing need hardware.
+  Status and what is next: [`PLAN.md`](PLAN.md) section 4.
 
 ## Production notes
 

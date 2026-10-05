@@ -43,6 +43,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # workerd links libcap-ng through the microsandbox SDK
+      # (msb_krun_devices -> capng). Clippy only type-checks, so it passes
+      # without it; `cargo test` links the binary and fails with
+      # "unable to find library -lcap-ng".
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcap-ng-dev
+
       # No `cargo fmt --check`: this codebase is hand-formatted (dense SQL
       # string continuations, deliberate one-line call sites) and rustfmt
       # rewrites every file in it. Adding the gate would mean a repo-wide

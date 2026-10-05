@@ -302,6 +302,30 @@ impl FakeWorker {
         Ok(w)
     }
 
+    /// A worker coming back after a crash or partition, still running
+    /// `running_sessions`. Returns once registered.
+    pub async fn connect_returning(h: &Harness, name: &str, running_sessions: Vec<Uuid>) -> Result<Self> {
+        let url = format!("{}/v1/worker", h.base.replace("http://", "ws://"));
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
+        let (tx, rx) = ws.split();
+        let mut w = FakeWorker { tx, rx };
+        w.send(Up::Register {
+            worker_name: name.into(),
+            auth_token: "test-worker-token".into(),
+            capacity_slots: 4,
+            msb_version: "test".into(),
+            on_disk_sessions: running_sessions.clone(),
+            running_sessions,
+            engines: vec![],
+            features: vec![],
+            running_machines: vec![],
+            on_disk_machines: vec![],
+            host: None,
+        })
+        .await?;
+        Ok(w)
+    }
+
     pub async fn send(&mut self, frame: Up) -> Result<()> {
         self.tx
             .send(Message::Text(serde_json::to_string(&frame)?.into()))

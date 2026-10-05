@@ -237,10 +237,10 @@ fn forbidden() -> AppError {
     AppError(StatusCode::FORBIDDEN, "not allowed".into())
 }
 
-/// 409 helpers for the reliability-rebuild tier rules.    Per RSD §4.4:
-/// premium sessions  must be warm; warm requires a  hot-pool worker; and warm
+/// 409 helpers for the reliability-rebuild tier rules. Per RSD §4.4:
+/// premium sessions must be warm; warm requires a hot-pool worker; and warm
 /// is only offered when the deployment has enough warm capacity to honour
-/// it.   Returning a plain 409 leaves the caller guessing; these helpers give
+/// it. Returning a plain 409 leaves the caller guessing; these helpers give
 /// the operator-actionable reason.
 fn premium_requires_warm() -> AppError {
     AppError(
@@ -259,7 +259,7 @@ fn premium_requires_hot_pool() -> AppError {
 fn warm_unavailable() -> AppError {
     AppError(
         StatusCode::CONFLICT,
-        "warm recovery is not available on this deployment ( PUKU_OFFER_WARM=false or no warm capacity)".into(),
+        "warm recovery is not available on this deployment (PUKU_OFFER_WARM=false or no warm capacity)".into(),
     )
 }
 

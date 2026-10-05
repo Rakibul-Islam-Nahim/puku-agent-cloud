@@ -157,7 +157,7 @@ pub fn service_for(state: &crate::AppState) -> Arc<dyn LeaseService> {
 /// the advisory lock sweeps. If this instance dies or loses Postgres the
 /// lock goes with its session and another instance takes over on its next
 /// tick.
-pub fn start_sweeper(svc: Arc<dyn LeaseService>, store: Arc<PgLeaseStore>) {
+pub fn start_sweeper(state: crate::AppState, svc: Arc<dyn LeaseService>, store: Arc<PgLeaseStore>) {
     use puku_leases::BmcProbe;
     let pool = store.pool.clone();
     let bmc: Arc<dyn BmcProbe> = Arc::new(puku_leases::bmc_probe::BmcProbeStub);
@@ -168,13 +168,16 @@ pub fn start_sweeper(svc: Arc<dyn LeaseService>, store: Arc<PgLeaseStore>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut lock = SweepLock::new();
         let mut held_for_mass_loss = false;
+        // Dead hosts whose settling failed (Postgres blip): retried every
+        // tick, since the sweeper reports a host dead only once.
+        let mut unsettled = std::collections::HashSet::new();
         loop {
             tick.tick().await;
             if !lock.hold(&pool).await {
                 continue;
             }
             match sweeper.sweep_once().await {
-                Ok(report) => act_on(&report, &mut held_for_mass_loss).await,
+                Ok(report) => act_on(&state, &report, &mut held_for_mass_loss, &mut unsettled).await,
                 Err(e) => tracing::warn!(error = %e, "lease sweeper error"),
             }
         }
@@ -233,7 +236,12 @@ impl SweepLock {
     }
 }
 
-async fn act_on(report: &SweepReport, held_for_mass_loss: &mut bool) {
+async fn act_on(
+    state: &crate::AppState,
+    report: &SweepReport,
+    held_for_mass_loss: &mut bool,
+    unsettled: &mut std::collections::HashSet<Uuid>,
+) {
     for host in &report.newly_suspected {
         tracing::warn!(host_id = %host, "worker host missed its lease; suspected, no new work");
     }
@@ -256,16 +264,26 @@ async fn act_on(report: &SweepReport, held_for_mass_loss: &mut bool) {
         }
         None => {}
     }
-    for host in &report.newly_dead {
-        handle_lease_lost(*host).await;
+    unsettled.extend(report.newly_dead.iter().copied());
+    let due: Vec<Uuid> = unsettled.iter().copied().collect();
+    for host in due {
+        if handle_lease_lost(state, host).await {
+            unsettled.remove(&host);
+        }
     }
 }
 
-/// A host was declared dead: fence it, then recover its sessions elsewhere.
-/// Per RSD §5.2.
-pub async fn handle_lease_lost(host_id: Uuid) {
+/// A host was declared dead: settle what it ran (see `hostloss`).
+/// Per RSD §5.2. Returns false when it must be retried.
+pub async fn handle_lease_lost(state: &crate::AppState, host_id: Uuid) -> bool {
     tracing::error!(host_id = %host_id, "worker host declared dead");
-    crate::fence::fence_on_lease_lost(host_id).await;
+    match crate::hostloss::on_host_dead(state, host_id).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(host_id = %host_id, error = format!("{e:#}"), "settling a dead host failed; retrying");
+            false
+        }
+    }
 }
 
 /// Public API used by scheduler.

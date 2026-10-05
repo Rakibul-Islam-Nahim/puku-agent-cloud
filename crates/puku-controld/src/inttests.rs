@@ -1999,3 +1999,157 @@ async fn only_one_instance_holds_the_sweeper_lock() {
     }
     panic!("the lock never passed to the surviving instance");
 }
+
+// --- A worker host declared dead -------------------------------------------
+
+async fn worker_id_of(h: &Harness, name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM workers WHERE name = $1").bind(name).fetch_one(&h.pool).await.unwrap()
+}
+
+async fn running_session(h: &Harness, w: &mut FakeWorker, prompt: &str) -> Uuid {
+    let id = create_session(h, serde_json::json!({"prompt": prompt})).await;
+    w.next_assignment().await.expect("assigned");
+    for st in [SessionState::Booting, SessionState::Bootstrapping, SessionState::Running] {
+        w.send(Up::SessionState { session_id: id, state: st, error: None, puku_session_id: None }).await.unwrap();
+    }
+    h.await_state(id, &["running"]).await;
+    id
+}
+
+/// The machine's host dies for good. It comes back on another worker from
+/// its latest snapshot, without anyone asking and without the 15-minute
+/// volume grace.
+#[tokio::test]
+async fn a_dead_host_s_machine_comes_back_elsewhere_from_its_snapshot() {
+    let Some(h) = snap_harness().await else { return };
+    let mut a = FakeWorker::connect_snapshot_worker(&h, "w-dies").await.unwrap();
+    let spec = running_machine(&h, &mut a, with_snapshots()).await;
+    let order = stop_with_snapshot(&h, &mut a, &spec).await;
+    // Running again on the same host, with that snapshot as its latest.
+    let (status, body) = h.post(&format!("/v1/machines/{}/start", spec.machine_id), serde_json::json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let again = a.next_machine_assignment().await.expect("restarted in place");
+    a.machine_state(&again, MS::Booting, true).await;
+    a.machine_state(&again, MS::Running, true).await;
+    machine_state_is(&h, spec.machine_id, "running").await;
+
+    let host = worker_id_of(&h, "w-dies").await;
+    drop(a);
+    until_workers_gone(&h).await;
+    let mut b = FakeWorker::connect_snapshot_worker(&h, "w-survivor").await.unwrap();
+
+    let report = crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+    assert_eq!(report.machines_restored, vec![spec.machine_id]);
+    let restored = b.next_machine_assignment().await.expect("the survivor gets the machine");
+    assert_eq!(restored.machine_id, spec.machine_id);
+    assert_eq!(restored.restore.expect("as a restore").snapshot_id, order.snapshot_id);
+
+    let again = crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+    assert!(again.machines_restored.is_empty() && again.machines_stopped.is_empty(), "idempotent: {again:?}");
+}
+
+#[tokio::test]
+async fn a_dead_host_s_machine_without_a_snapshot_is_stopped_saying_why() {
+    let h = harness!();
+    let mut a = FakeWorker::connect_machine_worker(&h, "w-nosnap").await.unwrap();
+    let spec = running_machine(&h, &mut a, serde_json::json!({})).await;
+    let host = worker_id_of(&h, "w-nosnap").await;
+    drop(a);
+    until_workers_gone(&h).await;
+
+    let report = crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+    assert_eq!(report.machines_stopped, vec![spec.machine_id]);
+    machine_state_is(&h, spec.machine_id, "stopped").await;
+    let (_, m) = h.get(&format!("/v1/machines/{}", spec.machine_id)).await;
+    assert!(m["error"].as_str().unwrap_or_default().contains("declared dead"), "{m}");
+}
+
+/// A running session is stopped (resumable), and one the host was handed
+/// but never started is placed on another worker.
+#[tokio::test]
+async fn a_dead_host_s_sessions_are_stopped_or_requeued() {
+    let h = harness!();
+    let mut a = FakeWorker::connect(&h, "w-sess-dies", "test-worker-token").await.unwrap();
+    let running = running_session(&h, &mut a, "long task").await;
+    let queued = create_session(&h, serde_json::json!({"prompt": "never started"})).await;
+    a.next_assignment().await.expect("handed to the doomed host");
+    let host = worker_id_of(&h, "w-sess-dies").await;
+    drop(a);
+    until_workers_gone(&h).await;
+
+    let report = crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+    assert_eq!(report.sessions_stopped, vec![running]);
+    assert_eq!(report.sessions_requeued, vec![queued]);
+    h.await_state(running, &["stopped"]).await;
+    let (_, s) = h.get(&format!("/v1/sessions/{running}")).await;
+    assert!(s["error"].as_str().unwrap_or_default().contains("lost"), "{s}");
+
+    let mut b = FakeWorker::connect(&h, "w-sess-new", "test-worker-token").await.unwrap();
+    let spec = b.next_assignment().await.expect("the queued session moves");
+    assert_eq!(spec.session_id, queued);
+}
+
+/// No split brain when the "dead" host was only cut off: on its return it
+/// is told to kill the session the platform already stopped.
+#[tokio::test]
+async fn a_dead_host_that_returns_is_told_to_kill_what_it_still_runs() {
+    use puku_cloud_proto::worker_proto::{Down, StopMode};
+    let h = harness!();
+    let mut a = FakeWorker::connect(&h, "w-partitioned", "test-worker-token").await.unwrap();
+    let id = running_session(&h, &mut a, "work").await;
+    let host = worker_id_of(&h, "w-partitioned").await;
+    drop(a);
+    until_workers_gone(&h).await;
+    crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+
+    let mut back = FakeWorker::connect_returning(&h, "w-partitioned", vec![id]).await.unwrap();
+    let killed = back
+        .next_matching(|d| match d {
+            Down::StopSession { session_id, mode: StopMode::Kill } => Some(session_id),
+            _ => None,
+        })
+        .await;
+    assert_eq!(killed, Some(id));
+}
+
+#[tokio::test]
+async fn a_host_still_linked_here_is_left_alone() {
+    let h = harness!();
+    let mut a = FakeWorker::connect_machine_worker(&h, "w-alive").await.unwrap();
+    let spec = running_machine(&h, &mut a, serde_json::json!({})).await;
+    let host = worker_id_of(&h, "w-alive").await;
+    let report = crate::hostloss::on_host_dead(&h.state, host).await.unwrap();
+    assert!(report.skipped_connected);
+    machine_state_is(&h, spec.machine_id, "running").await;
+}
+
+/// The whole chain: a lease worker's link drops, the sweeper suspects it,
+/// declares it dead after the grace period, and its machine is settled.
+#[tokio::test]
+async fn a_silent_lease_worker_is_swept_dead_and_its_machine_settled() {
+    use puku_leases::{LeaseServiceImpl, LeaseSweeper};
+    let h = harness!();
+    let mut a = FakeWorker::connect_lease_worker(&h, "w-silent").await.unwrap();
+    let spec = running_machine(&h, &mut a, serde_json::json!({})).await;
+    let host = worker_id_of(&h, "w-silent").await;
+    drop(a);
+    until_workers_gone(&h).await;
+
+    let store = std::sync::Arc::new(crate::leases::PgLeaseStore { pool: h.pool.clone() });
+    let svc = std::sync::Arc::new(LeaseServiceImpl::new(store.clone(), h.state.cfg.instance_id.to_string()));
+    let sweeper = LeaseSweeper::new(store, svc, std::sync::Arc::new(puku_leases::bmc_probe::BmcProbeStub));
+    let r = sweeper.sweep_once().await.unwrap();
+    assert_eq!(r.newly_suspected, vec![host], "expired on disconnect, suspected on the next sweep");
+    assert!(r.newly_dead.is_empty());
+    machine_state_is(&h, spec.machine_id, "running").await; // suspicion alone moves nothing
+
+    sqlx::query("UPDATE leases SET suspected_at = now() - interval '20 seconds' WHERE host_id = $1")
+        .bind(host)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let r = sweeper.sweep_once().await.unwrap();
+    assert_eq!(r.newly_dead, vec![host]);
+    assert!(crate::leases::handle_lease_lost(&h.state, host).await);
+    machine_state_is(&h, spec.machine_id, "stopped").await;
+}

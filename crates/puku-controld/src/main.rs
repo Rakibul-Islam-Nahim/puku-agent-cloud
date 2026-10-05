@@ -9,6 +9,7 @@ mod fakes3;
 mod fence;
 mod githubapp;
 mod harness;
+mod hostloss;
 mod leases;
 mod links;
 mod memory;

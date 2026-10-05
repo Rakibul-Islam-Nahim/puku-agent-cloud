@@ -546,6 +546,18 @@ pub async fn stop_lost(pool: &PgPool, worker_id: Uuid, still_running: &[Uuid]) -
     .await?)
 }
 
+/// Stop every live machine on a host the lease sweeper declared dead.
+/// Returns `(id, state it was in)`: what it was doing decides whether it is
+/// brought back elsewhere.
+pub async fn stop_on_dead_host(pool: &PgPool, worker_id: Uuid) -> Result<Vec<(Uuid, String)>> {
+    Ok(sqlx::query_as::<_, (Uuid, String)>(
+        "WITH was AS (              SELECT id, state FROM machines              WHERE worker_id = $1 AND state IN ('restoring', 'booting', 'running', 'stopping')              FOR UPDATE)          UPDATE machines m SET state = 'stopped', stopped_at = now(), worker_id = NULL,              error = 'the worker host running this machine was declared dead', last_reason = 'host_dead'          FROM was WHERE m.id = was.id          RETURNING m.id, was.state",
+    )
+    .bind(worker_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Hand back machines assigned to a worker that never booted them: the
 /// assignment went down a link that is now gone, and nothing else would
 /// ever re-send it. `except` is what the worker says it does run.

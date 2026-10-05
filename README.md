@@ -52,7 +52,7 @@ this section is the map and the parts that guide does not cover.
 | --- | --- | --- |
 | Build, run every test | Linux or macOS, Rust, Docker (or a local Postgres) | [1](#1-build-and-test) |
 | One box running real sessions | Linux with `/dev/kvm`, Postgres, the guest image | [2](#2-one-box-dev-or-single-host) |
-| Sessions that survive a dead host | 2+ worker hosts, a Ceph cluster | [3](#3-reliability-host-leases-and-shared-session-disks) |
+| Sessions that survive a dead host | 2+ worker hosts, a Ceph cluster | [3](#3-reliability-surviving-dead-hosts-crashed-vms-and-a-lost-pool) |
 
 ### Prerequisites
 
@@ -162,10 +162,19 @@ PUKU_RUNNER_CMD='echo "{\"type\":\"result\",\"subtype\":\"success\",\"total_cost
 ./target/debug/puku-cloud run "smoke"
 ```
 
-### 3. Reliability: host leases and shared session disks
+### 3. Reliability: surviving dead hosts, crashed VMs and a lost pool
 
-Two independent pieces (design: `docs/RELIABILITY-REBUILD.md`; what is
-built and tested: `PLAN.md` section 4).
+Design: `docs/RELIABILITY-REBUILD.md`; what is built and tested: `PLAN.md`
+section 4. The pieces, and what each needs:
+
+| Piece | What it does | Needs |
+| --- | --- | --- |
+| Host leases | notices a dead worker host in ~18 s and settles its work | nothing (on by default) |
+| Shared disks | session and machine disks on Ceph RBD, so work can move hosts | Ceph + `PUKU_RBD_POOL` |
+| Fencing | cuts a dead host off a disk before anyone else opens it | Ceph user with `osd blocklist` |
+| VM watchdog | restarts a VM that died or hung on a healthy host | nothing (on by default) |
+| Storage cleanup | deletes finished disks even when their host is down | shared disks |
+| Off-cluster backups | hourly encrypted backups; rebuilds a disk the pool lost | shared disks + object storage + `PUKU_SECRET_KEY` |
 
 **Host leases: on by default, nothing to configure.** Every worker sends
 a small "alive" frame each second; controld keeps one lease per host in
@@ -279,12 +288,50 @@ Operator note: a host that was fenced keeps a blocklisted Ceph client until
 its dead mappings are dropped; the startup cleanup does that, but rebooting a
 fenced host before it rejoins is still the safe default.
 
+#### Reliability settings at a glance
+
+| Setting | On | Default | What it does |
+| --- | --- | --- | --- |
+| `PUKU_RBD_POOL` | controld + every worker | unset (off) | the Ceph pool for shared disks; same on all |
+| `PUKU_CEPH_USER`, `PUKU_CEPH_CONF` | controld + every worker | `puku`, tool default | Ceph credentials and config |
+| `PUKU_RBD_SIZE_MIB` | worker | 20480 | size of a new session disk (thin) |
+| `PUKU_RBD_MACHINE_SIZE_MIB` | worker | 40960 | size of a new machine disk (thin) |
+| `PUKU_RBD_MAP_OPTIONS` | worker | empty | extra `rbd device map -o` options (`noshare` for tests) |
+| `PUKU_STORAGE_GC_S` | controld | 600 | seconds between storage cleanup sweeps |
+| `PUKU_STORAGE_GC_GRACE_S` | controld | 3600 | how long a disk must look finished before it is deleted |
+| `PUKU_STORAGE_GC_DRY_RUN` | controld | false | log deletions instead of doing them |
+| `PUKU_DISK_BACKUP` | controld | true | off-cluster backups (needs object storage + `PUKU_SECRET_KEY`) |
+| `PUKU_DISK_BACKUP_INTERVAL_S` | controld | 3600 | seconds between backups of one disk |
+| `PUKU_DISK_BACKUP_TMP` | controld | system temp dir | where exports are staged; needs room for the largest disk |
+
+#### Hardware for the full reliability setup
+
+The software runs on one machine for development and tests. To run (and
+prove) it for real:
+
+| What | How many | For | Minimum |
+| --- | --- | --- | --- |
+| Worker servers, bare metal | 2+ | the VMs; one can die and its work moves | VT-x / AMD-V, 16 cores, 64 GB RAM, 500 GB NVMe, IPMI or Redfish port |
+| Ceph storage servers | 3 | shared disks; Ceph needs 3 to survive losing one | 8 cores, 32 GB RAM, 1–2 NVMe of 1 TB+ each |
+| Control server (a VM is fine) | 1 | controld, Postgres, MinIO for backups | 4 cores, 16 GB RAM, backup disk ~2x the data on shared disks |
+| Network | — | Ceph traffic between all of them | 10 Gbps, 25 Gbps recommended; a separate Ceph network is better |
+
+All of it is open source on Ubuntu 24.04; no licences. On a tight budget the
+three Ceph servers can also be the workers for a test, but then losing one
+server loses a worker and a storage node at once.
+
+Still to do, and why it needs that hardware: memory snapshots (so running
+processes survive, not only files) wait on a speed comparison of VM engines
+on real servers; production object storage is a MinIO or Ceph RGW install;
+the final proof is unplugging a real server, and power-off fencing through
+its IPMI/Redfish port.
+
 ### Running the tests that need real infrastructure
 
 | Suite | Needs | Command |
 | --- | --- | --- |
 | Unit | nothing | `cargo test --workspace` |
-| controld integration (~220 tests) | Postgres | `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` |
+| controld integration (~235 tests) | Postgres | `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` |
 | RBD fencing on real Ceph | Ceph, root, user `client.puku`, pools `puku-base` (with protected `agent-base@v1`) and `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-volume --test real_ceph` |
 | Session disks moving between hosts on real Ceph | Ceph, root, pool `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-workerd real_ceph -- --test-threads=1` |
 | Disk backup and restore on real Ceph | Ceph, root, Postgres | `PUKU_TEST_CEPH=1 PUKU_TEST_DATABASE_URL=… cargo test -p puku-controld real_ceph` |
@@ -365,7 +412,11 @@ plus anything that has drifted out of step. `GET /v1/fleet` is the same data
 as JSON.
 
 Tests: see [Running the tests that need real infrastructure](#running-the-tests-that-need-real-infrastructure).
-CI sets `PUKU_TEST_DATABASE_URL` and fails if the integration tests silently skip.
+CI (`.github/workflows/ci.yml`) installs `libcap-ng-dev`, runs
+`cargo clippy --workspace --all-targets -- -D warnings`, runs every test
+against a Postgres service (and fails if the integration tests silently
+skip), runs the guest runner's test, and builds the controld image. The
+real-Ceph tests are not in CI: they need a Ceph cluster and root.
 
 ## Architecture
 
@@ -561,13 +612,16 @@ the Linux/KVM box.
   instances), image pre-pull on worker startup. Warm memory-snapshot pools
   remain future work (microsandbox snapshots are disk-only today).
 
-- **Reliability rebuild: in progress (branch `mahi`).** Host leases with a
-  single-leader sweeper and mass-loss guard; a dead host's machines and
-  sessions settled automatically; session and machine disks on Ceph RBD
-  that move to another host after the old one is fenced, with mid-turn
-  sessions and machines resumed there on their own. Tested against Postgres and a
-  real Ceph cluster; multi-host chaos runs and BMC fencing need hardware.
-  Status and what is next: [`PLAN.md`](PLAN.md) section 4.
+- **Reliability rebuild: software done; hardware proof pending.** Host
+  leases with a single-leader sweeper and mass-loss guard; a dead host's
+  machines and sessions settled automatically; session and machine disks on
+  Ceph RBD that move to another host after the old one is fenced, with
+  mid-turn sessions and machines resumed there on their own; a VM watchdog
+  for crashes on healthy hosts; storage cleanup that needs no host to be up;
+  encrypted off-cluster disk backups with automatic rebuild. Tested against
+  Postgres and a real (single-node) Ceph cluster. Memory snapshots,
+  multi-host chaos runs and BMC fencing need the hardware above. Status:
+  [`PLAN.md`](PLAN.md) section 4.
 
 ## Production notes
 

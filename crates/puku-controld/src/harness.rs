@@ -49,12 +49,46 @@ pub struct Harness {
     pub pool_admin: Option<Arc<FakePool>>,
 }
 
-/// An in-memory Ceph pool for the storage cleanup.
+/// An in-memory Ceph pool for the storage cleanup and disk backups.
 #[derive(Default)]
 pub struct FakePool {
     pub images: std::sync::Mutex<Vec<String>>,
     /// Images some client has open.
     pub open: std::sync::Mutex<Vec<String>>,
+    /// Image contents, and snapshots of them, for backup tests.
+    pub data: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    pub snaps: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
+    /// Images that are gone (deleted, or lost with the pool). Every other
+    /// name exists, as a booted shared disk would.
+    pub lost: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl FakePool {
+    /// Create or overwrite an image's contents.
+    pub fn write(&self, image: &str, bytes: &[u8]) {
+        let mut images = self.images.lock().unwrap();
+        if !images.iter().any(|i| i == image) {
+            images.push(image.to_string());
+        }
+        self.data.lock().unwrap().insert(image.to_string(), bytes.to_vec());
+        self.lost.lock().unwrap().remove(image);
+    }
+    /// The image is gone, as after losing the pool.
+    pub fn lose(&self, image: &str) {
+        self.images.lock().unwrap().retain(|i| i != image);
+        self.data.lock().unwrap().remove(image);
+        self.snaps.lock().unwrap().retain(|(i, _), _| i != image);
+        self.lost.lock().unwrap().insert(image.to_string());
+    }
+    pub fn read(&self, image: &str) -> Option<Vec<u8>> {
+        self.data.lock().unwrap().get(image).cloned()
+    }
+    pub fn snap_names(&self, image: &str) -> Vec<String> {
+        let mut v: Vec<String> =
+            self.snaps.lock().unwrap().keys().filter(|(i, _)| i == image).map(|(_, s)| s.clone()).collect();
+        v.sort();
+        v
+    }
 }
 
 #[async_trait::async_trait]
@@ -67,7 +101,60 @@ impl crate::storagegc::PoolAdmin for FakePool {
         Ok(if open { vec!["10.0.0.7:0/9".into()] } else { vec![] })
     }
     async fn remove(&self, image: &str) -> anyhow::Result<()> {
-        self.images.lock().unwrap().retain(|i| i != image);
+        self.lose(image);
+        Ok(())
+    }
+    async fn exists(&self, image: &str) -> anyhow::Result<bool> {
+        Ok(!self.lost.lock().unwrap().contains(image))
+    }
+    async fn snap_create(&self, image: &str, snap: &str) -> anyhow::Result<()> {
+        let data = self.read(image).unwrap_or_default();
+        self.snaps.lock().unwrap().insert((image.into(), snap.into()), data);
+        Ok(())
+    }
+    async fn snap_remove(&self, image: &str, snap: &str) -> anyhow::Result<()> {
+        self.snaps.lock().unwrap().remove(&(image.to_string(), snap.to_string()));
+        Ok(())
+    }
+    async fn snap_list(&self, image: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self.snap_names(image))
+    }
+    async fn changed_since(&self, image: &str, from: &str, to: &str) -> anyhow::Result<bool> {
+        let s = self.snaps.lock().unwrap();
+        Ok(s.get(&(image.into(), from.into())) != s.get(&(image.into(), to.into())))
+    }
+    async fn export_full(&self, image: &str, snap: &str, path: &str) -> anyhow::Result<()> {
+        let data = self.snaps.lock().unwrap().get(&(image.into(), snap.into())).cloned().unwrap_or_default();
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+    /// A "diff" here is the whole snapshot behind a header naming both ends.
+    async fn export_diff(&self, image: &str, from: &str, to: &str, path: &str) -> anyhow::Result<()> {
+        let data = self.snaps.lock().unwrap().get(&(image.into(), to.into())).cloned().unwrap_or_default();
+        let mut out = format!("DIFF\n{from}\n{to}\n").into_bytes();
+        out.extend(data);
+        std::fs::write(path, out)?;
+        Ok(())
+    }
+    async fn import_full(&self, path: &str, image: &str, snap: &str) -> anyhow::Result<()> {
+        let data = std::fs::read(path)?;
+        self.write(image, &data);
+        self.snaps.lock().unwrap().insert((image.into(), snap.into()), data);
+        Ok(())
+    }
+    async fn import_diff(&self, path: &str, image: &str) -> anyhow::Result<()> {
+        let raw = std::fs::read(path)?;
+        let mut parts = raw.splitn(4, |b| *b == b'\n');
+        anyhow::ensure!(parts.next() == Some(b"DIFF"), "not a diff");
+        let from = String::from_utf8(parts.next().unwrap_or_default().to_vec())?;
+        let to = String::from_utf8(parts.next().unwrap_or_default().to_vec())?;
+        let data = parts.next().unwrap_or_default().to_vec();
+        anyhow::ensure!(
+            self.snaps.lock().unwrap().contains_key(&(image.into(), from.clone())),
+            "import-diff: start snapshot {from} missing on {image}"
+        );
+        self.write(image, &data);
+        self.snaps.lock().unwrap().insert((image.into(), to), data);
         Ok(())
     }
 }
@@ -75,10 +162,12 @@ impl crate::storagegc::PoolAdmin for FakePool {
 /// A `Fence` that records what it was asked to cut off, and can be told to
 /// refuse. Stands in for Ceph: the real blocklist is proven by
 /// `puku-volume/tests/real_ceph.rs`.
+/// One `fence_volumes` call: old host, session, volumes.
+pub type FenceCall = (Uuid, Option<Uuid>, Vec<String>);
+
 #[derive(Default)]
 pub struct RecordingFence {
-    /// (old host, session) per `fence_volumes` call, with the volumes.
-    pub calls: std::sync::Mutex<Vec<(Uuid, Option<Uuid>, Vec<String>)>>,
+    pub calls: std::sync::Mutex<Vec<FenceCall>>,
     pub refuse: std::sync::atomic::AtomicBool,
 }
 
@@ -195,6 +284,10 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
             fence: f,
             admin,
             gc: crate::storagegc::GcPolicy { grace: std::time::Duration::ZERO, ..Default::default() },
+            backup: Some(crate::diskbackup::BackupPolicy {
+                tmp_dir: std::env::temp_dir().join(format!("puku-bk-{}", Uuid::new_v4().simple())),
+                ..Default::default()
+            }),
         })
     });
     let state = AppState {

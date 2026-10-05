@@ -266,6 +266,7 @@ pub fn spawn(state: AppState) {
 /// ultimately picks a worker does. This function returns the right column
 /// expression to use in worker-selection so a scheduled run lands on the
 /// same host its sibling sessions land on (RSD §4.3.3).
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 pub fn fingerprint_expr() -> &'static str {
     "COALESCE((SELECT host_id FROM sessions WHERE fingerprint = $1 AND host_id IS NOT NULL \
                ORDER BY created_at DESC LIMIT 1), $2::uuid)"
@@ -275,6 +276,7 @@ pub fn fingerprint_expr() -> &'static str {
 /// Returns the host id of the most-recent sibling session with the same
 /// fingerprint, or `None` if there is none. The dispatcher uses this to
 /// avoid paying RBD-snap cost on a fresh host (RSD §4.3.3).
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 pub async fn preferred_host_for_fingerprint(
     pool: &sqlx::PgPool,
     fingerprint: &str,

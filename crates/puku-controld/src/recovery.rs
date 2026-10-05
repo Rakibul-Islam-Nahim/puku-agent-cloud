@@ -126,9 +126,12 @@ pub async fn recover_session(
     let outcome = driver.pick_manifest(session.id, prefer_local).await;
     let outcome = match outcome {
         Ok(Some(m)) => {
-            if prefer_local && m.status.acceptable_for_local_restore() {
-                RestoreOutcome::Warm(m)
-            } else if !prefer_local && m.status.acceptable_for_remote_restore() {
+            let usable = if prefer_local {
+                m.status.acceptable_for_local_restore()
+            } else {
+                m.status.acceptable_for_remote_restore()
+            };
+            if usable {
                 RestoreOutcome::Warm(m)
             } else {
                 match driver.current_volume(session.id).await {

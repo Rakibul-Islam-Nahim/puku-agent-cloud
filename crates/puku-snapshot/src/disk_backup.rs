@@ -13,7 +13,6 @@
 //!
 //! Compaction: 24 diffs -> new full, retire the old chain (children first).
 
-use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,5 +143,5 @@ mod tests {
     #[allow(dead_code)]
     fn _check_sink_object_safe(_sink: &dyn BackupSink) {}
     #[allow(dead_code)]
-    fn _check_path_object_safe(_p: PathBuf) {}
+    fn _check_path_object_safe(_p: std::path::PathBuf) {}
 }

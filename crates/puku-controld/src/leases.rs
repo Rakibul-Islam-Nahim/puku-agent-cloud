@@ -291,11 +291,3 @@ pub async fn handle_lease_lost(state: &crate::AppState, host_id: Uuid) -> bool {
         }
     }
 }
-
-/// Public API used by scheduler.
-pub async fn is_host_healthy(svc: &dyn LeaseService, host_id: Uuid) -> bool {
-    match svc.lookup(host_id).await {
-        Ok(Some(l)) => l.state == LeaseState::Held && !l.is_expired(chrono::Utc::now()),
-        _ => false,
-    }
-}

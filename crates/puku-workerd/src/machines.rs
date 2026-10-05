@@ -121,6 +121,50 @@ impl Machines {
         });
     }
 
+    /// Probe every running machine's VM; one that stops answering is torn
+    /// down and reported failed with reason `vm_crashed` (controld restarts
+    /// it). Without this a dead machine VM stayed `running` for ever.
+    pub fn spawn_watchdog(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut dogs: HashMap<(Uuid, u64), crate::watchdog::Watchdog> = HashMap::new();
+            let mut tick = tokio::time::interval(crate::watchdog::PROBE_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                this.watch_once(&mut dogs).await;
+            }
+        });
+    }
+
+    async fn watch_once(&self, dogs: &mut HashMap<(Uuid, u64), crate::watchdog::Watchdog>) {
+        let running: Vec<Arc<Running>> = self.inner.running.lock().unwrap().values().cloned().collect();
+        dogs.retain(|k, _| running.iter().any(|r| (r.spec.machine_id, r.spec.generation) == *k));
+        for r in running {
+            let key = (r.spec.machine_id, r.spec.generation);
+            let verdict = dogs.entry(key).or_default().observe(crate::watchdog::probe(r.vm.as_ref()).await);
+            if let Some(why) = verdict {
+                dogs.remove(&key);
+                self.crashed(&r.spec, why).await;
+            }
+        }
+    }
+
+    /// The watchdog's verdict on one boot: tear it down, report it.
+    async fn crashed(&self, spec: &MachineSpec, why: String) {
+        let lock = self.lock(spec.machine_id);
+        let _guard = lock.lock().await;
+        // Only the boot that was probed: a newer one supersedes the verdict.
+        if !self.get(spec.machine_id).is_some_and(|r| r.spec.generation == spec.generation) {
+            return;
+        }
+        tracing::error!(machine = %spec.machine_id, generation = spec.generation, "{why}");
+        self.teardown(spec.machine_id).await;
+        let _ = std::fs::remove_file(self.dir(spec.machine_id).join("spec.json"));
+        self.report(spec, MachineState::Failed, Some(why), Some("vm_crashed"), false);
+        self.release_when_idle(spec.machine_id);
+    }
+
     pub fn get(&self, id: Uuid) -> Option<Arc<Running>> {
         self.inner.running.lock().unwrap().get(&id).cloned()
     }
@@ -586,6 +630,29 @@ mod tests {
 
     /// The flag the API turns into `resumed`: false on the first boot, true
     /// once the volume is there from before.
+    /// A machine VM that stops answering is torn down and reported failed
+    /// with reason `vm_crashed` after three missed probes -- not before.
+    #[tokio::test]
+    async fn a_machine_vm_that_stops_answering_is_reported_crashed() {
+        let (m, fake, mut rx, _dir) = setup();
+        let id = Uuid::new_v4();
+        m.assign(spec(id, 1)).await;
+        while rx.try_recv().is_ok() {}
+        fake.fail_execs(true);
+        let mut dogs = HashMap::new();
+        m.watch_once(&mut dogs).await;
+        m.watch_once(&mut dogs).await;
+        assert!(m.get(id).is_some(), "two misses are not a crash");
+        m.watch_once(&mut dogs).await;
+        assert!(m.get(id).is_none(), "torn down after the third");
+        match rx.try_recv() {
+            Ok(Up::MachineState { state: MachineState::Failed, reason, .. }) => {
+                assert_eq!(reason.as_deref(), Some("vm_crashed"))
+            }
+            other => panic!("expected a vm_crashed report, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn the_second_boot_finds_its_volume() {
         let (m, _fake, mut rx, _dir) = setup();

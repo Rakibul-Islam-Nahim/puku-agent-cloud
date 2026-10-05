@@ -5,7 +5,6 @@
 //! the base and re-parents the in-flight captures (the cut-over is in
 //! `compaction.rs`).
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::manifest::Manifest;

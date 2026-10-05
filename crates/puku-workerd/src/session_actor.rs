@@ -61,6 +61,8 @@ enum Outcome {
     Parked,
     Killed,
     Error(String),
+    /// The watchdog: the VM died or stopped answering.
+    Crashed(String),
 }
 
 /// What the tailer needs from the actor: the signals it raises, and the
@@ -444,8 +446,9 @@ impl SessionActor {
                 (SessionState::Failed, Some(msg))
             }
             Outcome::Parked => (SessionState::Stopped, None),
+            Outcome::Crashed(ref why) => (SessionState::Stopped, Some(why.clone())),
             Outcome::Killed => (SessionState::Canceled, None),
-            Outcome::Error(e) => (SessionState::Failed, Some(e)),
+            Outcome::Error(ref e) => (SessionState::Failed, Some(e.clone())),
         };
         // Get the work out before anything reaps the volume. Only for a
         // session that actually finished: a parked session will resume and
@@ -473,7 +476,14 @@ impl SessionActor {
         if let Err(e) = self.volumes.close(&self.state_dir, session_id).await {
             tracing::error!(%session_id, error = format!("{e:#}"), "releasing the session disk failed");
         }
-        self.send_state(state, error);
+        match outcome {
+            // Not a state the session chose: say what happened and let
+            // controld decide whether to start it again.
+            Outcome::Crashed(detail) => {
+                let _ = self.up_tx.send(Up::SessionCrashed { session_id, detail });
+            }
+            _ => self.send_state(state, error),
+        }
         self.sessions.remove(session_id);
         Ok(())
     }
@@ -653,6 +663,9 @@ impl SessionActor {
 
         let idle_timeout = Duration::from_secs(self.spec.idle_timeout_s.max(60) as u64);
         let mut idle_tick = tokio::time::interval(Duration::from_secs(15));
+        let mut watchdog_tick = tokio::time::interval(crate::watchdog::PROBE_EVERY);
+        watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut watchdog = crate::watchdog::Watchdog::default();
 
         loop {
             tokio::select! {
@@ -710,6 +723,12 @@ impl SessionActor {
                     // Exit marker seen in the outbox — the authoritative
                     // (and only) completion signal.
                     return Ok(Outcome::Exited(code.unwrap_or(-1)));
+                }
+                _ = watchdog_tick.tick() => {
+                    if let Some(why) = watchdog.observe(crate::watchdog::probe(sandbox).await) {
+                        tracing::error!(session = %self.spec.session_id, "{why}");
+                        return Ok(Outcome::Crashed(why));
+                    }
                 }
                 _ = idle_tick.tick() => {
                     // A session blocked on a question idles at 4x the normal

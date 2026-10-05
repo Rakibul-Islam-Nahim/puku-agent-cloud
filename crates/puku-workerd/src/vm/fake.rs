@@ -17,6 +17,8 @@ struct Shared {
     live: Mutex<Vec<String>>,
     removes_to_fail: AtomicU32,
     remove_attempts: AtomicU32,
+    /// Every exec fails: the VM is dead or hung.
+    execs_fail: std::sync::atomic::AtomicBool,
 }
 
 pub struct FakeBackend {
@@ -33,6 +35,11 @@ impl FakeBackend {
     /// being released.
     pub fn fail_removes(&self, n: u32) {
         self.shared.removes_to_fail.store(n, Ordering::SeqCst);
+    }
+
+    /// Make every exec fail, as a VM whose VMM died would.
+    pub fn fail_execs(&self, on: bool) {
+        self.shared.execs_fail.store(on, Ordering::SeqCst);
     }
 
     pub fn remove_attempts(&self) -> u32 {
@@ -61,6 +68,9 @@ impl Vm for FakeVm {
 
     async fn exec(&self, req: ExecRequest) -> Result<ExecOutput> {
         self.shared.execs.lock().unwrap().push((self.name.clone(), req));
+        if self.shared.execs_fail.load(Ordering::SeqCst) {
+            anyhow::bail!("the VM is not running");
+        }
         Ok(ExecOutput::default())
     }
 

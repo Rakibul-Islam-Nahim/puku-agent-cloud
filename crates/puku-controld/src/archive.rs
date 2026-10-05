@@ -14,6 +14,7 @@ use crate::{db, AppState};
 /// Re-entry tier transition: when a session with `tier='cold_archived'` is
 /// resumed, bump it back to `hibernated` so the sweeper picks it up. RSD §5.4.2.
 /// Returns Ok(true) when the row was actually transitioned.
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 pub async fn tier_warm_on_resume(state: &AppState, session_id: Uuid) -> Result<bool> {
     let res = sqlx::query(
         "UPDATE sessions SET tier = 'hibernated', tier_changed_at = now(), last_resumed_at = now() \
@@ -28,6 +29,7 @@ pub async fn tier_warm_on_resume(state: &AppState, session_id: Uuid) -> Result<b
 
 /// Tier transition: running -> hibernated when the session is parked. Called
 /// from the session-state-transition path (api/post_stop). RSD §5.4.2.
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 pub async fn tier_to_hibernated(state: &AppState, session_id: Uuid) -> Result<()> {
     sqlx::query(
         "UPDATE sessions SET tier = 'hibernated', tier_changed_at = now() \

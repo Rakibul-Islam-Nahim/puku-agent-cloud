@@ -309,6 +309,101 @@ impl RbdBackend {
         Ok(())
     }
 
+    /// Whether an image exists.
+    pub async fn exists(&self, vol: &VolumeId) -> Result<bool, VolumeError> {
+        let out = self.rbd(&["info", vol.as_str()]).await?;
+        if out.success() {
+            return Ok(true);
+        }
+        if out.stderr.contains("No such file") {
+            return Ok(false);
+        }
+        Err(Self::rejected("rbd info", &out))
+    }
+
+    /// Take a named snapshot of an image. Idempotent.
+    pub async fn snap_create(&self, vol: &VolumeId, snap: &str) -> Result<(), VolumeError> {
+        let spec = format!("{vol}@{snap}");
+        let out = self.rbd(&["snap", "create", "--no-progress", &spec]).await?;
+        if !out.success() && !out.stderr.contains("File exists") {
+            return Err(Self::rejected("rbd snap create", &out));
+        }
+        Ok(())
+    }
+
+    /// Delete a snapshot. Idempotent.
+    pub async fn snap_remove(&self, vol: &VolumeId, snap: &str) -> Result<(), VolumeError> {
+        let spec = format!("{vol}@{snap}");
+        let out = self.rbd(&["snap", "rm", "--no-progress", &spec]).await?;
+        if !out.success() && !out.stderr.contains("No such file") {
+            return Err(Self::rejected("rbd snap rm", &out));
+        }
+        Ok(())
+    }
+
+    /// Snapshot names of an image, oldest first.
+    pub async fn snap_list(&self, vol: &VolumeId) -> Result<Vec<String>, VolumeError> {
+        let out = self.rbd(&["snap", "ls", "--format", "json", vol.as_str()]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd snap ls", &out));
+        }
+        let v = first_json(&out.stdout, "rbd snap ls")?;
+        Ok(v.as_array()
+            .map(|a| a.iter().filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(str::to_string)).collect())
+            .unwrap_or_default())
+    }
+
+    /// Whether anything changed between two snapshots.
+    pub async fn changed_since(&self, vol: &VolumeId, from: &str, to: &str) -> Result<bool, VolumeError> {
+        let spec = format!("{vol}@{to}");
+        let out = self.rbd(&["diff", "--format", "json", "--from-snap", from, &spec]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd diff", &out));
+        }
+        let v = first_json(&out.stdout, "rbd diff")?;
+        Ok(v.as_array().is_some_and(|a| !a.is_empty()))
+    }
+
+    /// Write the whole image as of `snap` to `path` (`rbd export`).
+    pub async fn export_full(&self, vol: &VolumeId, snap: &str, path: &str) -> Result<(), VolumeError> {
+        let spec = format!("{vol}@{snap}");
+        let out = self.rbd(&["export", "--no-progress", &spec, path]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd export", &out));
+        }
+        Ok(())
+    }
+
+    /// Write only what changed from `from` to `to` (`rbd export-diff`).
+    pub async fn export_diff(&self, vol: &VolumeId, from: &str, to: &str, path: &str) -> Result<(), VolumeError> {
+        let spec = format!("{vol}@{to}");
+        let out = self.rbd(&["export-diff", "--no-progress", "--from-snap", from, &spec, path]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd export-diff", &out));
+        }
+        Ok(())
+    }
+
+    /// Create `vol` from a full export, and mark it with snapshot `snap` so
+    /// later diffs apply on top (`rbd import`).
+    pub async fn import_full(&self, path: &str, vol: &VolumeId, snap: &str) -> Result<(), VolumeError> {
+        let out = self.rbd(&["import", "--no-progress", path, vol.as_str()]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd import", &out));
+        }
+        self.snap_create(vol, snap).await
+    }
+
+    /// Apply a diff export on top of `vol` (`rbd import-diff`); it creates
+    /// the diff's end snapshot itself.
+    pub async fn import_diff(&self, path: &str, vol: &VolumeId) -> Result<(), VolumeError> {
+        let out = self.rbd(&["import-diff", "--no-progress", path, vol.as_str()]).await?;
+        if !out.success() {
+            return Err(Self::rejected("rbd import-diff", &out));
+        }
+        Ok(())
+    }
+
     /// Every image in the sessions pool, by name.
     pub async fn list_images(&self) -> Result<Vec<String>, VolumeError> {
         let pool = self.cfg()?.pool_sessions.clone();

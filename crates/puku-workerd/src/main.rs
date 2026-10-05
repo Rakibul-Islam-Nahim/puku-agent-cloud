@@ -2,12 +2,14 @@ mod controlplane;
 mod datalink;
 mod gitpush;
 mod hostcap;
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 mod idle;
 mod machines;
 mod session_actor;
 mod snapshot;
 mod uploader;
 mod volumes;
+mod watchdog;
 mod vm;
 
 use std::path::PathBuf;

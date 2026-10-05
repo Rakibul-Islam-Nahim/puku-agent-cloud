@@ -2,9 +2,11 @@ mod api;
 mod archive;
 mod blobstore;
 mod connectors;
+mod crashes;
 mod auth;
 mod datalink;
 mod db;
+mod diskbackup;
 mod fakes3;
 mod fence;
 mod githubapp;
@@ -16,6 +18,7 @@ mod memory;
 mod inttests;
 mod notify;
 mod oauth;
+#[allow(dead_code)] // The RSD's recovery planner; recovery today is hostloss.rs + sharedvol.rs.
 mod recovery;
 mod relay;
 mod sampling;
@@ -68,6 +71,16 @@ struct Args {
     /// Log what the cleanup would delete, delete nothing.
     #[arg(long, env = "PUKU_STORAGE_GC_DRY_RUN", default_value_t = false)]
     storage_gc_dry_run: bool,
+    /// Off-cluster backups of shared disks to object storage. On by default
+    /// whenever shared disks, object storage and PUKU_SECRET_KEY are all set.
+    #[arg(long, env = "PUKU_DISK_BACKUP", default_value_t = true, action = clap::ArgAction::Set)]
+    disk_backup: bool,
+    /// Seconds between backups of one disk.
+    #[arg(long, env = "PUKU_DISK_BACKUP_INTERVAL_S", default_value_t = 3600)]
+    disk_backup_interval_s: u64,
+    /// Where exports are staged before upload. Needs room for the largest disk.
+    #[arg(long, env = "PUKU_DISK_BACKUP_TMP")]
+    disk_backup_tmp: Option<String>,
     #[arg(long, env = "PUKU_LISTEN_ADDR", default_value = "127.0.0.1:7770")]
     listen_addr: String,
     /// Shared secret workers present in Register. Read from
@@ -778,6 +791,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 grace: Duration::from_secs(args.storage_gc_grace_s),
                 dry_run: args.storage_gc_dry_run,
             },
+            backup: args.disk_backup.then(|| diskbackup::BackupPolicy {
+                interval: Duration::from_secs(args.disk_backup_interval_s.max(60)),
+                tmp_dir: args
+                    .disk_backup_tmp
+                    .clone()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| diskbackup::BackupPolicy::default().tmp_dir),
+                ..Default::default()
+            }),
         })
     });
     let state = AppState {

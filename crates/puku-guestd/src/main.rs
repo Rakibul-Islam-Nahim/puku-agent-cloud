@@ -12,6 +12,7 @@
 
 mod cmdline;
 mod frames;
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 mod package_watcher;
 
 #[cfg(target_os = "linux")]

@@ -23,7 +23,7 @@ pub fn reapable_newest_first(manifests: &[Manifest]) -> Vec<&Manifest> {
     // Newest first by `ts`. Children are inserted later (greater ts) than
     // their parent, so this ordering matches child-before-parent for the
     // diff chain. (RSD §4.4.4: "delete children first".)
-    m.sort_by(|a, b| b.ts.cmp(&a.ts));
+    m.sort_by_key(|x| std::cmp::Reverse(x.ts));
     m
 }
 
@@ -31,7 +31,7 @@ pub fn reapable_newest_first(manifests: &[Manifest]) -> Vec<&Manifest> {
 /// Used by the test suite to catch retention bugs.
 pub fn is_valid_reaper_order(ordered: &[&Manifest]) -> bool {
     let by_id = |id: uuid::Uuid| -> Option<&Manifest> {
-        ordered.iter().find(|m| m.id == id).map(|m| *m)
+        ordered.iter().find(|m| m.id == id).copied()
     };
     for m in ordered {
         if let Some(parent_id) = m.parent_manifest_id {

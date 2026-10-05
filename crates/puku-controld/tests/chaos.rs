@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use puku_fence::{AuditEntry, AuditSink, InMemoryAuditSink};
 use puku_leases::{Lease, LeaseError, LeaseService, LeaseServiceImpl, LeaseStore};
-use puku_proxy::{Event, EventSink, EventSource, InMemoryEventSink, InMemoryTokenStore, ProxyConfig, ReconnectToken, RecoveryChoice, SessionProxy};
+use puku_proxy::{Event, EventSink, EventSource, InMemoryEventSink, InMemoryTokenStore, ProxyConfig, RecoveryChoice, SessionProxy};
 use puku_rebuild::{build_script, InstalledPackage, PackageKind};
 use puku_snapshot::{
     effective_recovery_mode, overlay_merge, reapable_newest_first, Manifest, Page, RecoveryMode,
@@ -67,6 +67,7 @@ impl EventSource for StubSource {
     }
 }
 
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 async fn make_proxy() -> (Arc<InMemoryEventSink>, SessionProxy, Uuid) {
     let sid = Uuid::new_v4();
     let mut by_session = HashMap::new();

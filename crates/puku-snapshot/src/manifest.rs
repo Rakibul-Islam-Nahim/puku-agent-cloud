@@ -74,6 +74,7 @@ impl Manifest {
     /// A new pending manifest. `is_full` requires `parent_manifest_id = None`,
     /// a diff requires a parent. Enforced by the schema CHECK
     /// `parent_requires_diff` (RSD §3.3).
+    #[allow(clippy::too_many_arguments)] // one per manifest column
     pub fn new_pending(
         session_id: Uuid,
         disk_snap_id: impl Into<String>,

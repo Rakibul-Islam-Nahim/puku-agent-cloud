@@ -254,6 +254,27 @@ on any worker being alive:
 | workerd, at startup | when a host starts or comes back after being declared dead | disks it still has mapped but no longer runs (unmounted, force-unmapped: a fenced host's dead mappings), and local session folders whose disk lives in Ceph. It never reattaches a session whose disk is not mounted |
 | controld, always | every report | a report or event from a worker that no longer owns the session is ignored, and that worker is told to kill its copy |
 
+**VM watchdog.** Every 15 s the worker runs `true` inside each running VM. Three
+missed answers in a row (about 45 s) mean the VM died or hung while its host
+stayed up: it is torn down, its disk released, and controld starts it again
+(a session that was mid-turn continues with a "your VM crashed, continue"
+message; one waiting for an answer is only stopped). A third crash within 30
+minutes stops the automatic restarts and the reason says so.
+
+**Off-cluster disk backups.** Ceph's three copies cover a lost drive or host,
+not a lost pool. With shared disks, object storage (`PUKU_R2_*`) and
+`PUKU_SECRET_KEY` all set, one controld backs up every shared disk each
+`PUKU_DISK_BACKUP_INTERVAL_S` (default 3600): an RBD snapshot, then a full
+`rbd export` the first time (and after 24 diffs) or an `rbd export-diff` of
+what changed since the last backup (skipped when nothing changed). Each
+export is compressed and encrypted in 4 MiB frames with its own data key,
+uploaded in parts, then read back and checked before it counts. If a shared
+disk is ever missing when it is needed, controld rebuilds it from the latest
+full plus every later diff before anything boots on it; with no backup the
+session fails with that reason instead of starting on an empty disk.
+`PUKU_DISK_BACKUP=false` turns this off; `PUKU_DISK_BACKUP_TMP` is where
+exports are staged (needs room for the largest disk).
+
 Operator note: a host that was fenced keeps a blocklisted Ceph client until
 its dead mappings are dropped; the startup cleanup does that, but rebooting a
 fenced host before it rejoins is still the safe default.
@@ -266,6 +287,7 @@ fenced host before it rejoins is still the safe default.
 | controld integration (~220 tests) | Postgres | `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` |
 | RBD fencing on real Ceph | Ceph, root, user `client.puku`, pools `puku-base` (with protected `agent-base@v1`) and `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-volume --test real_ceph` |
 | Session disks moving between hosts on real Ceph | Ceph, root, pool `puku-sessions` | `PUKU_TEST_CEPH=1 cargo test -p puku-workerd real_ceph -- --test-threads=1` |
+| Disk backup and restore on real Ceph | Ceph, root, Postgres | `PUKU_TEST_CEPH=1 PUKU_TEST_DATABASE_URL=… cargo test -p puku-controld real_ceph` |
 
 A single-node test Ceph works (MicroCeph: `snap install microceph`,
 `microceph cluster bootstrap`, `microceph disk add loop,4G,3`). Use the

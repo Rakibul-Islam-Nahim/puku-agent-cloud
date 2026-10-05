@@ -676,7 +676,9 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
             }
             db::worker_heartbeat(&state.pool, worker_id, used_slots as i32).await?;
         }
-        Up::SessionEvents { session_id, .. } | Up::SessionState { session_id, .. }
+        Up::SessionEvents { session_id, .. }
+        | Up::SessionState { session_id, .. }
+        | Up::SessionCrashed { session_id, .. }
             if !owns_session(state, worker_id, session_id).await? =>
         {
             // A worker that came back after its session was settled or moved
@@ -687,6 +689,10 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
             if let Some(w) = state.workers.get(worker_id) {
                 w.send(Down::StopSession { session_id, mode: puku_cloud_proto::worker_proto::StopMode::Kill });
             }
+        }
+        Up::SessionCrashed { session_id, detail } => {
+            let outcome = crate::crashes::on_session_crash(state, session_id, &detail).await?;
+            tracing::info!(session = %session_id, ?outcome, "session VM crash handled");
         }
         Up::SessionEvents { session_id, mut events } => {
             // Workers name blobs by key; only controld knows the bucket, so
@@ -907,7 +913,12 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
                         }
                         puku_cloud_proto::machine::MachineState::Stopped
                         | puku_cloud_proto::machine::MachineState::Failed => {
-                            db::machines::close_runs(&state.pool, machine_id).await?
+                            db::machines::close_runs(&state.pool, machine_id).await?;
+                            if reason.as_deref() == Some("vm_crashed") {
+                                let detail = error.clone().unwrap_or_default();
+                                let outcome = crate::crashes::on_machine_crash(state, machine_id, &detail).await?;
+                                tracing::info!(machine = %machine_id, ?outcome, "machine VM crash handled");
+                            }
                         }
                         _ => {}
                     }

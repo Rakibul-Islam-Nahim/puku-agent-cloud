@@ -195,16 +195,19 @@ The table in §6 predates the code: most of the crates it lists now exist. This 
 | Moving a shared-disk session (`controld/sharedvol.rs`, dispatch) | Home connected → goes home, no fence. Home declared dead (lease released) → fence home off the disk, then any shared-volume worker. Home only away → waits (never fences a live host). Fence fails → stays queued | Postgres integration tests with a recording fence |
 | Machine disks on RBD (`workerd/volumes.rs` `MachineDisks`, migration 0034) | A machine's whole state directory (volume + kept root disk, so installed packages too) is one RBD image, open only while a boot, restore or capture needs it. Home dead → fenced, then boots on any shared-disk worker with its disk (no snapshot). A copy-cleanup never deletes the shared image; only an explicit destroy does | Scripted test + real-Ceph test (volume and root disk move together; cleanup keeps the image) + Postgres integration tests |
 | Storage cleanup (`controld/storagegc.rs`, workerd startup cleanup) | Pool sweep by one controld: deletes images of archived/gone sessions and destroyed/gone machines after a grace period, never an open one, audited, dry-run option. Workers at startup drop stale mappings (incl. a fenced host's) and leftover local folders, and never reattach a session whose disk is not mounted. Reports from a worker that no longer owns a session are ignored | Postgres integration tests (fake pool) + real-Ceph test: a crashed host's mapping is released and the disk reopens with its data |
+| VM watchdog (`workerd/watchdog.rs`, `controld/crashes.rs`) | Probes every running session and machine VM every 15 s; 3 misses → torn down, reported, restarted by controld (sessions with a continue message); 3 crashes in 30 min stops the restarts | Unit tests (probe, miss counting, machine teardown) + Postgres integration tests (restart, crash loop, machine reboot, stale report ignored) |
+| Off-cluster disk backups (`controld/diskbackup.rs`, migration 0035) | Hourly RBD snapshot → full export (first / after 24 diffs) or diff export (skipped if unchanged) → zstd + ChaCha20-Poly1305 frames with a per-backup key → multipart upload → read-back check → `Durable`. Missing shared disk is rebuilt from the chain before use; no backup → the session fails instead of starting empty | Frame tamper test; Postgres + in-process S3 tests (chain, compaction, rebuild, lost-without-backup); real-Ceph test: disk deleted and rebuilt byte-identical |
 | Auto-resume after a host dies | A shared-disk session that was mid-turn is queued again at once with a "continue where you left off" message; shared-disk machines are restarted elsewhere | Postgres integration tests |
 | Dead host handling (`controld/hostloss.rs`) | Machines with a ready snapshot restored elsewhere at once, others stopped with a reason; running sessions stopped (resumable), booting ones failed, unstarted ones requeued; a returning host is told to kill what the platform stopped | Postgres integration tests, incl. sweep → dead → settled |
 
 **Not done yet, in order:**
 
-1. Desired-state on stop; VM-crash watchdog (a VM that dies while its host stays up).
+1. Desired-state on stop.
 2. Auto-resume of a session that was waiting for an answer (today it waits for the answer).
-3. A fenced host that comes back keeps a blocklisted Ceph client: reboot it before it rejoins (runbook item until workerd checks this itself).
-4. Encrypted memory snapshots (reuse the `snapshots.rs` data-key pipeline); S3-compatible storage (MinIO / Ceph RGW) instead of R2; drop the 5 s premium-RPO assumption.
-5. Multi-host chaos runs (two workerd processes on one box first; real hardware for BMC and 3-node Ceph).
+3. Nahim's `puku-proxy` (client reconnect proxy) and `puku-rebuild` (replay installed packages): compiled and unit-tested, not wired. Shared disks keep installed packages, so `puku-rebuild` matters only for host-local disks.
+4. Encrypted memory snapshots, so running processes survive and not only files: needs the R0 engine bake-off first (which hypervisor's snapshots are fast enough).
+5. Production object storage on our own hardware (MinIO / Ceph RGW): code already speaks S3; this is deployment work.
+6. Multi-host chaos runs (two workerd processes on one box first; real hardware for BMC and 3-node Ceph).
 
 How to run the tests: `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` (controld integration tests skip without it); `PUKU_TEST_CEPH=1 cargo test -p puku-volume --test real_ceph` on a host with Ceph and a `client.puku` key.
 

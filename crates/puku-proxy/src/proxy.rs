@@ -105,6 +105,31 @@ impl SessionProxy {
     }
 }
 
+// Helper for tests: replay with an overridden source.
+impl SessionProxy {
+    pub async fn replay_with_source(
+        &self,
+        token: ReconnectToken,
+        source: Arc<dyn EventSource>,
+    ) -> Result<(HelloFrame, Vec<Event>), String> {
+        let state = self
+            .tokens
+            .lookup(&token)
+            .await
+            .ok_or_else(|| "unknown reconnect token".to_string())?;
+        let events = source.events_after(state.session_id, state.last_seq).await?;
+        Ok((
+            HelloFrame {
+                last_seq: state.last_seq,
+                instance_id: self.cfg.instance_id.clone(),
+                recovery_choice: RecoveryChoice::Local,
+                token,
+            },
+            events,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,30 +219,5 @@ mod tests {
             .unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].seq, 3);
-    }
-}
-
-// Helper for tests: replay with an overridden source.
-impl SessionProxy {
-    pub async fn replay_with_source(
-        &self,
-        token: ReconnectToken,
-        source: Arc<dyn EventSource>,
-    ) -> Result<(HelloFrame, Vec<Event>), String> {
-        let state = self
-            .tokens
-            .lookup(&token)
-            .await
-            .ok_or_else(|| "unknown reconnect token".to_string())?;
-        let events = source.events_after(state.session_id, state.last_seq).await?;
-        Ok((
-            HelloFrame {
-                last_seq: state.last_seq,
-                instance_id: self.cfg.instance_id.clone(),
-                recovery_choice: RecoveryChoice::Local,
-                token,
-            },
-            events,
-        ))
     }
 }

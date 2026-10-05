@@ -37,6 +37,8 @@ thiserror = { workspace = true }
 jsonwebtoken = "9"
 sha2 = "0.11.0"
 hex = "0.4.3"
+# Disk backups: frames are compressed before they are sealed.
+zstd = "0.13"
 cron = "0.15"
 rusty-s3 = "0.10"
 chacha20poly1305 = "0.10"

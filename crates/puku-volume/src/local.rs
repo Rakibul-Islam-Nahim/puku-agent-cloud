@@ -40,7 +40,7 @@ pub struct LocalBackend {
 impl LocalBackend {
     pub fn new(cfg: LocalBackendConfig) -> Self {
         Self {
-            cfg: cfg,
+            cfg,
             attached: Mutex::new(HashMap::new()),
             fenced: Mutex::new(Vec::new()),
         }

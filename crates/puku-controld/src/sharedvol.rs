@@ -38,6 +38,8 @@ pub struct SharedVolumes {
     /// Lists and deletes images for the storage cleanup (`storagegc`).
     pub admin: Arc<dyn crate::storagegc::PoolAdmin>,
     pub gc: crate::storagegc::GcPolicy,
+    /// Off-cluster disk backups; None turns them off.
+    pub backup: Option<crate::diskbackup::BackupPolicy>,
 }
 
 impl SharedVolumes {

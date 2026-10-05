@@ -114,6 +114,7 @@ impl Link {
     /// data sockets open. Before registering, so Register lists them.
     pub async fn start_machines(&self) {
         self.machines.reconcile_from_disk().await;
+        self.machines.spawn_watchdog();
         self.data.spawn();
     }
 

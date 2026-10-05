@@ -1232,6 +1232,14 @@ async fn placeable(state: &AppState, m: &mut MachineRow, relocate: bool) -> anyh
 async fn dispatch_one(state: &AppState, m: &MachineRow) -> anyhow::Result<Result<(), Unplaceable>> {
     let mut m = m.clone();
     let home = m.volume_worker_id;
+    if m.volume_shared
+        && !crate::diskbackup::ensure_disk(state, crate::diskbackup::Subject::Machine(m.id)).await?
+    {
+        let reason = "this machine's disk is gone from shared storage and there is no backup to rebuild it from";
+        tracing::error!(machine = %m.id, "{reason}");
+        mdb::unschedule(&state.pool, m.id, m.generation, "disk_lost", reason).await?;
+        return Ok(Ok(()));
+    }
     if shared_home_released(state, &m).await? {
         let Some(old) = home else { unreachable!("released implies a home") };
         if let Err(e) = crate::sharedvol::fence_for_move(state, old, crate::sharedvol::Moving::Machine(m.id)).await {

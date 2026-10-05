@@ -193,7 +193,7 @@ async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossRepo
                 if next == SessionState::Failed {
                     report.sessions_failed.push(id);
                 } else if shared && cur == SessionState::Running && state.shared_volumes.is_some() {
-                    match resume_elsewhere(state, id).await {
+                    match resume_elsewhere(state, id, CONTINUE_PROMPT).await {
                         Ok(()) => report.sessions_resumed.push(id),
                         Err(e) => {
                             tracing::warn!(session = %id, error = format!("{e:#}"), "auto-resume failed; left stopped");
@@ -223,7 +223,7 @@ have been saved.";
 /// that already has a conversation continues it with `CONTINUE_PROMPT`; one
 /// whose agent never got going keeps its original prompt and starts over on
 /// the same disk.
-async fn resume_elsewhere(state: &AppState, id: Uuid) -> anyhow::Result<()> {
+pub(crate) async fn resume_elsewhere(state: &AppState, id: Uuid, continue_prompt: &'static str) -> anyhow::Result<()> {
     let has_conversation: bool =
         sqlx::query_scalar("SELECT puku_session_id IS NOT NULL FROM sessions WHERE id = $1")
             .bind(id)
@@ -233,7 +233,7 @@ async fn resume_elsewhere(state: &AppState, id: Uuid) -> anyhow::Result<()> {
         .bind(id)
         .execute(&state.pool)
         .await?;
-    let prompt = has_conversation.then_some(CONTINUE_PROMPT);
+    let prompt = has_conversation.then_some(continue_prompt);
     let (_, ev) = db::transition_with_prompt(&state.pool, id, SessionState::Scheduled, None, prompt).await?;
     if let Some(ev) = ev {
         state.publish_events(&[ev]).await;

@@ -242,6 +242,7 @@ fn forbidden() -> AppError {
 /// is only offered when the deployment has enough warm capacity to honour
 /// it. Returning a plain 409 leaves the caller guessing; these helpers give
 /// the operator-actionable reason.
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 fn premium_requires_warm() -> AppError {
     AppError(
         StatusCode::CONFLICT,
@@ -249,6 +250,7 @@ fn premium_requires_warm() -> AppError {
     )
 }
 
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 fn premium_requires_hot_pool() -> AppError {
     AppError(
         StatusCode::CONFLICT,
@@ -256,6 +258,7 @@ fn premium_requires_hot_pool() -> AppError {
     )
 }
 
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 fn warm_unavailable() -> AppError {
     AppError(
         StatusCode::CONFLICT,
@@ -2252,6 +2255,16 @@ async fn shared_disk_placement(state: &AppState, session: &SessionRow, engine: E
     let (true, Some(home)) = (session.volume_shared, session.volume_worker_id) else {
         return Ok(SharedPlacement::NotShared);
     };
+    // Its disk must exist before anyone boots on it: a worker would create
+    // an empty one in its place. Gone (a lost pool) -> rebuilt from backup.
+    if !crate::diskbackup::ensure_disk(state, crate::diskbackup::Subject::Session(session.id)).await? {
+        let reason = "this session's disk is gone from shared storage and there is no backup to rebuild it from";
+        tracing::error!(session = %session.id, "{reason}");
+        if let Ok((_, Some(ev))) = db::transition(&state.pool, session.id, SessionState::Failed, Some(reason)).await {
+            state.publish_events(&[ev]).await;
+        }
+        return Ok(SharedPlacement::Wait);
+    }
     if state.workers.get(home).is_some() {
         return Ok(SharedPlacement::Place(Placement { engine, pinned: Some(home), ..Placement::default() }));
     }

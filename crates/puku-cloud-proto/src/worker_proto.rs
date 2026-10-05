@@ -144,6 +144,13 @@ pub enum Up {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<HostReport>,
     },
+    /// The session's VM died or hung while this host stayed up (the
+    /// watchdog's verdict). The session is torn down and its disk released;
+    /// controld decides whether to start it again.
+    SessionCrashed {
+        session_id: Uuid,
+        detail: String,
+    },
     /// "Still alive", once a second, from a worker that advertised
     /// `FEATURE_LEASE`. Kept separate from `Heartbeat` (every 10 s, carries
     /// inventory) so liveness is cheap and frequent.

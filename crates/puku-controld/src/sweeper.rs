@@ -23,6 +23,7 @@ use crate::AppState;
 /// Tier states driven by the sweeper. Per RSD §5.4.2. Distinct from the
 /// session-level `state` column (which tracks the VM lifecycle); this tracks
 /// the snapshot tier a session's data lives at right now.
+#[allow(dead_code)] // Designed in docs/RELIABILITY-REBUILD.md but not wired in yet (PLAN.md section 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotTier {
     /// Warm - a full or diff snapshot is durable on a worker.
@@ -35,6 +36,7 @@ pub enum SnapshotTier {
     Archived,
 }
 
+#[allow(dead_code)]
 impl SnapshotTier {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -59,6 +61,8 @@ pub fn spawn_all(state: AppState) {
 
     // Storage cleanup of the shared pool: needs no worker to be up.
     crate::storagegc::spawn(state.clone());
+    // Off-cluster backups of shared disks.
+    crate::diskbackup::spawn(state.clone());
 }
 
 /// Tier transitions: any session in `running` whose desired_state is `stopped`
@@ -112,19 +116,17 @@ async fn tier_transitions_once(state: &AppState) -> anyhow::Result<()> {
         // worker that's offline keeps the directory until next sweep.
         for r in &rows {
             let id: Uuid = r.get("id");
-            if let Ok(Some((worker_id_opt,))) =
+            if let Ok(Some((Some(w),))) =
                 sqlx::query_as::<_, (Option<Uuid>,)>("SELECT worker_id FROM sessions WHERE id = $1")
                     .bind(id)
                     .fetch_optional(&state.pool)
                     .await
             {
-                if let Some(w) = worker_id_opt {
-                    let _ = crate::workerlink::send_to_worker(
-                        state,
-                        Some(w),
-                        puku_cloud_proto::worker_proto::Down::ReapSession { session_id: id },
-                    );
-                }
+                let _ = crate::workerlink::send_to_worker(
+                    state,
+                    Some(w),
+                    puku_cloud_proto::worker_proto::Down::ReapSession { session_id: id },
+                );
             }
         }
     }
@@ -172,7 +174,7 @@ async fn snapshot_retention_once(state: &AppState) -> anyhow::Result<()> {
 
     let keep = 5i64;
     let mut deleted = 0u64;
-    for (_, snaps) in by_session.iter_mut() {
+    for snaps in by_session.values_mut() {
         snaps.sort_by_key(|s| std::cmp::Reverse(s.2));
         // Drop anything past `keep`; the FK chain ensures dependents are
         // gone first.

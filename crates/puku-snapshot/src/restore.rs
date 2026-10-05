@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::manifest::{Manifest, ManifestStore, SnapshotStatus};
+use crate::manifest::{Manifest, SnapshotStatus};
 use puku_volume::VolumeId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,20 +85,17 @@ impl<B: RestoreBackend> RestoreService<B> {
         session_id: Uuid,
         prefer_local: bool,
     ) -> Result<RestoreOutcome, RestoreError> {
-        match self.backend.pick_manifest(session_id, prefer_local).await? {
-            Some(m) => {
-                if prefer_local && m.status.acceptable_for_local_restore() {
-                    return Ok(RestoreOutcome::Warm(m));
-                }
-                if !prefer_local && m.status.acceptable_for_remote_restore() {
-                    return Ok(RestoreOutcome::Warm(m));
-                }
-                if m.r2_sha256.is_some() {
-                    return Ok(RestoreOutcome::FromArchive(m));
-                }
-                // fall through
+        if let Some(m) = self.backend.pick_manifest(session_id, prefer_local).await? {
+            if prefer_local && m.status.acceptable_for_local_restore() {
+                return Ok(RestoreOutcome::Warm(m));
             }
-            None => {}
+            if !prefer_local && m.status.acceptable_for_remote_restore() {
+                return Ok(RestoreOutcome::Warm(m));
+            }
+            if m.r2_sha256.is_some() {
+                return Ok(RestoreOutcome::FromArchive(m));
+            }
+            // fall through
         }
         match self.backend.current_volume(session_id).await? {
             Some(v) => Ok(RestoreOutcome::ColdHead(v)),
@@ -110,7 +107,7 @@ impl<B: RestoreBackend> RestoreService<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    
     use tokio::sync::Mutex;
     use crate::manifest::SnapshotStatus;
 

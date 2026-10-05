@@ -1,0 +1,362 @@
+//! Where a session's files live on this worker.
+//!
+//! `Local` is how it always worked: `<state>/sessions/<id>/{session,workspace}`
+//! on this host's disk, so the session can only ever run here again.
+//!
+//! `Rbd` puts them on a Ceph RBD image per session, mounted at
+//! `<state>/sessions/<id>/disk` while the session runs here and unmounted
+//! and unmapped when it stops. Any worker on the same cluster can then open
+//! it next -- which is what lets a session outlive its host. The image is
+//! mapped `--exclusive`, so two hosts can never have it open read-write at
+//! once; moving it off a host that died is controld's job, and controld
+//! fences that host first.
+//!
+//! What stays on this host's own disk in both modes is the small
+//! `<state>/sessions/<id>/spec.json`, which records that this worker is
+//! running the session (the restart-reconcile index).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use puku_volume::{CommandRunner, HostId, RbdBackend, SystemRunner, VolumeBackend, VolumeId};
+use uuid::Uuid;
+
+pub fn session_base_dir(state_dir: &Path, session_id: Uuid) -> PathBuf {
+    state_dir.join("sessions").join(session_id.to_string())
+}
+
+#[derive(Clone)]
+pub enum SessionVolumes {
+    Local,
+    Rbd(Arc<RbdVolumes>),
+}
+
+pub struct RbdVolumes {
+    pub backend: RbdBackend,
+    /// Size of a new session image. Thin-provisioned: only what is written
+    /// takes space.
+    pub size_mib: u64,
+    /// Runs `mountpoint`, `blkid`, `mkfs.ext4`, `mount`, `umount`.
+    pub runner: Arc<dyn CommandRunner>,
+}
+
+impl RbdVolumes {
+    pub fn new(backend: RbdBackend, size_mib: u64) -> Self {
+        Self { backend, size_mib, runner: Arc::new(SystemRunner) }
+    }
+}
+
+/// `HostId` is only consulted by the backend's in-memory simulation.
+const THIS_HOST: HostId = HostId(Uuid::nil());
+
+impl SessionVolumes {
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Rbd(_))
+    }
+
+    /// Where `session/` and `workspace/` live. Valid once `open` returned.
+    pub fn data_dir(&self, state_dir: &Path, session_id: Uuid) -> PathBuf {
+        let base = session_base_dir(state_dir, session_id);
+        match self {
+            Self::Local => base,
+            Self::Rbd(_) => base.join("disk"),
+        }
+    }
+
+    /// Make the session's files available here, creating them on first use.
+    /// Idempotent: a session already open here (a workerd restart under a
+    /// running VM) is left as it is.
+    pub async fn open(&self, state_dir: &Path, session_id: Uuid) -> Result<PathBuf> {
+        let dir = self.data_dir(state_dir, session_id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let Self::Rbd(r) = self else { return Ok(dir) };
+        if r.is_mounted(&dir).await? {
+            return Ok(dir);
+        }
+        let vol = r.backend.create_blank(session_id, r.size_mib).await.context("creating the session's disk")?;
+        let dev = r.backend.attach(&vol, THIS_HOST).await.map_err(|e| {
+            anyhow::anyhow!(
+                "the session's disk {vol} could not be opened here ({e}); another host may still hold it"
+            )
+        })?;
+        let dev = dev.as_path().to_string_lossy().to_string();
+        if !r.has_filesystem(&dev).await? {
+            r.run_ok("mkfs.ext4", &["-q", "-F", "-L", "puku-session", &dev]).await?;
+        }
+        r.run_ok("mount", &["-o", "noatime", &dev, &dir.to_string_lossy()]).await?;
+        tracing::info!(%session_id, volume = %vol, device = %dev, "session disk mounted");
+        Ok(dir)
+    }
+
+    /// Release the session's files from this host so another can open them:
+    /// unmount (which flushes) and unmap. Idempotent.
+    pub async fn close(&self, state_dir: &Path, session_id: Uuid) -> Result<()> {
+        let Self::Rbd(r) = self else { return Ok(()) };
+        let dir = self.data_dir(state_dir, session_id);
+        if r.is_mounted(&dir).await? {
+            r.run_ok("umount", &[&dir.to_string_lossy()]).await?;
+        }
+        let vol = r.backend.session_volume(session_id)?;
+        r.backend.detach(&vol, THIS_HOST).await.with_context(|| format!("unmapping {vol}"))?;
+        tracing::info!(%session_id, volume = %vol, "session disk released");
+        Ok(())
+    }
+
+    /// Delete the session's files for good.
+    pub async fn destroy(&self, state_dir: &Path, session_id: Uuid) -> Result<()> {
+        let base = session_base_dir(state_dir, session_id);
+        if let Self::Rbd(r) = self {
+            self.close(state_dir, session_id).await?;
+            let vol: VolumeId = r.backend.session_volume(session_id)?;
+            r.backend.remove(&vol).await.with_context(|| format!("deleting {vol}"))?;
+        }
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", base.display())),
+        }
+    }
+}
+
+impl RbdVolumes {
+    async fn is_mounted(&self, dir: &Path) -> Result<bool> {
+        let out = self.runner.run("mountpoint", &["-q".to_string(), dir.to_string_lossy().to_string()]).await?;
+        Ok(out.success())
+    }
+
+    /// `blkid -p` exits 2 when it finds nothing on the device.
+    async fn has_filesystem(&self, dev: &str) -> Result<bool> {
+        let args = ["-p", "-s", "TYPE", "-o", "value", dev].map(String::from);
+        let out = self.runner.run("blkid", &args).await?;
+        match out.status {
+            0 => Ok(true),
+            2 => Ok(false),
+            n => bail!("blkid {dev} failed (exit {n}): {}", out.stderr.trim()),
+        }
+    }
+
+    async fn run_ok(&self, program: &str, args: &[&str]) -> Result<()> {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = self.runner.run(program, &args).await?;
+        if !out.success() {
+            bail!("{program} {} failed (exit {}): {}", args.join(" "), out.status, out.stderr.trim());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use puku_volume::{CmdOutput, RbdBackendConfig, ScriptedRunner};
+
+    /// One scripted runner behind both the backend and the mount helpers, so
+    /// the test sees every command in order.
+    fn rbd(answers: Vec<CmdOutput>) -> (SessionVolumes, Arc<ScriptedRunner>) {
+        let runner = Arc::new(ScriptedRunner::new(answers));
+        let cfg = RbdBackendConfig::new("puku-base", "puku-sessions");
+        let backend = RbdBackend::with_runner(cfg, runner.clone());
+        let v = RbdVolumes { backend, size_mib: 1024, runner: runner.clone() };
+        (SessionVolumes::Rbd(Arc::new(v)), runner)
+    }
+
+    fn programs(r: &ScriptedRunner) -> Vec<String> {
+        r.calls().iter().map(|c| c.split(' ').take(2).collect::<Vec<_>>().join(" ")).collect()
+    }
+
+    #[tokio::test]
+    async fn first_open_creates_maps_formats_and_mounts() {
+        let tmp = std::env::temp_dir().join(format!("puku-vol-{}", Uuid::new_v4()));
+        let sid = Uuid::new_v4();
+        let (v, r) = rbd(vec![
+            CmdOutput::fail(1, ""),           // mountpoint: not mounted
+            CmdOutput::ok(""),                // rbd create
+            CmdOutput::ok("[]"),              // rbd device list
+            CmdOutput::ok("/dev/rbd7\n"),     // rbd device map
+            CmdOutput::fail(2, ""),           // blkid: nothing there
+            CmdOutput::ok(""),                // mkfs.ext4
+            CmdOutput::ok(""),                // mount
+        ]);
+        let dir = v.open(&tmp, sid).await.unwrap();
+        assert_eq!(dir, session_base_dir(&tmp, sid).join("disk"));
+        assert_eq!(
+            programs(&r),
+            ["mountpoint -q", "rbd create", "rbd device", "rbd device", "blkid -p", "mkfs.ext4 -q", "mount -o"]
+        );
+        assert!(r.calls()[3].starts_with("rbd device map --exclusive"));
+        assert!(r.calls()[6].contains("/dev/rbd7"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn reopening_an_existing_disk_never_reformats_it() {
+        let tmp = std::env::temp_dir().join(format!("puku-vol-{}", Uuid::new_v4()));
+        let (v, r) = rbd(vec![
+            CmdOutput::fail(1, ""),
+            CmdOutput::fail(17, "rbd: create error: (17) File exists"),
+            CmdOutput::ok("[]"),
+            CmdOutput::ok("/dev/rbd2\n"),
+            CmdOutput::ok("ext4\n"),          // blkid: already has a filesystem
+            CmdOutput::ok(""),                // mount
+        ]);
+        v.open(&tmp, Uuid::new_v4()).await.unwrap();
+        assert!(!programs(&r).iter().any(|p| p.starts_with("mkfs")), "{:?}", r.calls());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn an_open_session_is_left_alone() {
+        let tmp = std::env::temp_dir().join(format!("puku-vol-{}", Uuid::new_v4()));
+        let (v, r) = rbd(vec![CmdOutput::ok("")]); // mountpoint: mounted
+        v.open(&tmp, Uuid::new_v4()).await.unwrap();
+        assert_eq!(r.calls().len(), 1);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn a_disk_held_elsewhere_fails_with_a_reason() {
+        let tmp = std::env::temp_dir().join(format!("puku-vol-{}", Uuid::new_v4()));
+        let (v, _) = rbd(vec![
+            CmdOutput::fail(1, ""),
+            CmdOutput::ok(""),
+            CmdOutput::ok("[]"),
+            CmdOutput::fail(16, "rbd: map failed: (16) Device or resource busy"),
+        ]);
+        let err = format!("{:#}", v.open(&tmp, Uuid::new_v4()).await.unwrap_err());
+        assert!(err.contains("another host may still hold it"), "{err}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn close_unmounts_then_unmaps() {
+        let tmp = std::env::temp_dir();
+        let sid = Uuid::new_v4();
+        let list = format!(r#"[{{"pool":"puku-sessions","namespace":"","name":"{sid}","device":"/dev/rbd7"}}]"#);
+        let (v, r) = rbd(vec![
+            CmdOutput::ok(""),      // mountpoint: mounted
+            CmdOutput::ok(""),      // umount
+            CmdOutput::ok(&list),   // rbd device list
+            CmdOutput::ok(""),      // rbd device unmap
+        ]);
+        v.close(&tmp, sid).await.unwrap();
+        assert_eq!(programs(&r)[0], "mountpoint -q");
+        assert!(r.calls()[1].starts_with("umount ") && r.calls()[1].ends_with("/disk"), "{:?}", r.calls());
+        assert!(r.calls()[2].starts_with("rbd device list"));
+        assert!(r.calls()[3].starts_with(&format!("rbd device unmap puku-sessions/{sid}")));
+    }
+
+    #[tokio::test]
+    async fn a_failed_unmount_is_not_followed_by_an_unmap() {
+        let (v, r) = rbd(vec![CmdOutput::ok(""), CmdOutput::fail(32, "umount: target is busy")]);
+        assert!(v.close(&std::env::temp_dir(), Uuid::new_v4()).await.is_err());
+        assert_eq!(r.calls().len(), 2, "never unmap a disk still mounted");
+    }
+
+    #[tokio::test]
+    async fn local_volumes_never_run_a_command() {
+        let tmp = std::env::temp_dir().join(format!("puku-vol-{}", Uuid::new_v4()));
+        let sid = Uuid::new_v4();
+        let dir = SessionVolumes::Local.open(&tmp, sid).await.unwrap();
+        assert_eq!(dir, session_base_dir(&tmp, sid));
+        SessionVolumes::Local.close(&tmp, sid).await.unwrap();
+        SessionVolumes::Local.destroy(&tmp, sid).await.unwrap();
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // --- Against a real Ceph cluster (PUKU_TEST_CEPH=1, root, cephx user
+    // `puku`, pool `puku-sessions`). Two `noshare` backends on one machine
+    // act as two hosts.
+
+    fn real_enabled() -> bool {
+        std::env::var("PUKU_TEST_CEPH").as_deref() == Ok("1")
+    }
+
+    fn real_host() -> SessionVolumes {
+        let cfg = RbdBackendConfig::new("puku-sessions", "puku-sessions").with_map_options(&["noshare"]);
+        SessionVolumes::Rbd(Arc::new(RbdVolumes::new(RbdBackend::new(cfg), 256)))
+    }
+
+    fn sh(cmd: &str) -> (i32, String) {
+        let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().expect("sh");
+        (out.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+
+    fn state_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("puku-real-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn real_ceph_a_session_disk_follows_the_session_between_hosts() {
+        if !real_enabled() {
+            return;
+        }
+        let (a, b) = (real_host(), real_host());
+        let (sa, sb) = (state_dir("a"), state_dir("b"));
+        let sid = Uuid::new_v4();
+
+        let dir = a.open(&sa, sid).await.expect("open on A");
+        std::fs::create_dir_all(dir.join("workspace")).unwrap();
+        std::fs::write(dir.join("workspace/notes.txt"), "written on A").unwrap();
+        a.close(&sa, sid).await.expect("close on A");
+        assert_ne!(sh(&format!("mountpoint -q {}", dir.display())).0, 0, "unmounted on A");
+
+        let dir = b.open(&sb, sid).await.expect("open on B");
+        assert_eq!(std::fs::read_to_string(dir.join("workspace/notes.txt")).unwrap(), "written on A");
+        b.close(&sb, sid).await.expect("close on B");
+
+        b.destroy(&sb, sid).await.expect("destroy");
+        let (rc, _) = sh(&format!("rbd info puku-sessions/{sid} --id puku"));
+        assert_ne!(rc, 0, "the image is gone");
+        std::fs::remove_dir_all(&sa).ok();
+    }
+
+    /// A dies holding the disk. B is refused until A is fenced; then B
+    /// opens it and finds everything A had synced.
+    #[tokio::test]
+    async fn real_ceph_a_crashed_host_must_be_fenced_before_another_opens_the_disk() {
+        if !real_enabled() {
+            return;
+        }
+        let (a, b) = (real_host(), real_host());
+        let (sa, sb) = (state_dir("a"), state_dir("b"));
+        let sid = Uuid::new_v4();
+        let vol = VolumeId(format!("puku-sessions/{sid}"));
+
+        let dir_a = a.open(&sa, sid).await.expect("open on A");
+        std::fs::write(dir_a.join("fsynced.txt"), "made it to disk").unwrap();
+        assert_eq!(sh(&format!("sync -f {}", dir_a.display())).0, 0);
+        // A crashes here: no close.
+
+        // B is refused while A holds the exclusive lock. A raw map: on one
+        // machine B's backend would reuse A's mapping from the shared
+        // kernel, which a separate host cannot see.
+        let (rc, out) = sh(&format!("rbd device map --exclusive -o noshare {vol} --id puku"));
+        assert_ne!(rc, 0, "B must be refused while A holds the disk: {out}");
+
+        let SessionVolumes::Rbd(rb) = &b else { unreachable!() };
+        let fenced = rb.backend.fence_volume(&vol).await.expect("fence A");
+        assert!(!fenced.is_empty(), "A's client is cut off");
+
+        // A's machine is gone: on one box, drop its mount and mapping the
+        // way a dead host's simply vanish.
+        let (_, list) = sh("rbd device list --format json --id puku");
+        let dev = puku_volume::rbd::parse_device_list(&list)
+            .into_iter()
+            .find(|(spec, _)| spec == vol.as_str())
+            .map(|(_, d)| d)
+            .expect("A's mapping");
+        assert_eq!(sh(&format!("umount -l {}", dir_a.display())).0, 0);
+        sh(&format!("rbd device unmap -o force {dev}"));
+
+        let dir_b = b.open(&sb, sid).await.expect("B opens the disk after the fence");
+        assert_eq!(std::fs::read_to_string(dir_b.join("fsynced.txt")).unwrap(), "made it to disk");
+
+        b.destroy(&sb, sid).await.expect("destroy");
+        rb.backend.unfence_addrs(&fenced).await.expect("unfence");
+        std::fs::remove_dir_all(&sa).ok();
+    }
+}

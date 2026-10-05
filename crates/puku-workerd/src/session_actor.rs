@@ -116,6 +116,8 @@ pub struct SessionActor {
     pub git_tokens: crate::gitpush::GitTokens,
     /// The engine `spec.engine` names, as this worker runs it.
     pub backend: Arc<dyn VmBackend>,
+    /// Where the session's files live (this host's disk, or an RBD image).
+    pub volumes: crate::volumes::SessionVolumes,
 }
 
 /// Download, verify and unpack one skill pack.
@@ -203,9 +205,7 @@ fn hand_to_guest(path: &Path) {
     let _ = path;
 }
 
-pub fn session_base_dir(state_dir: &Path, session_id: uuid::Uuid) -> PathBuf {
-    state_dir.join("sessions").join(session_id.to_string())
-}
+pub use crate::volumes::session_base_dir;
 
 impl SessionActor {
     fn send_state(&self, state: SessionState, error: Option<String>) {
@@ -219,10 +219,16 @@ impl SessionActor {
 
     pub async fn run(self, input_rx: mpsc::UnboundedReceiver<InputCmd>) {
         let session_id = self.spec.session_id;
+        let (volumes, state_dir) = (self.volumes.clone(), self.state_dir.clone());
         match self.run_inner(input_rx).await {
             Ok(()) => {}
             Err(e) => {
                 tracing::error!(%session_id, error = format!("{e:#}"), "session actor failed");
+                // An error path that skipped the normal teardown must not
+                // leave the disk mapped here, where no other host can open it.
+                if let Err(e) = volumes.close(&state_dir, session_id).await {
+                    tracing::error!(%session_id, error = format!("{e:#}"), "releasing the session disk failed");
+                }
             }
         }
     }
@@ -230,8 +236,15 @@ impl SessionActor {
     async fn run_inner(self, mut input_rx: mpsc::UnboundedReceiver<InputCmd>) -> Result<()> {
         let session_id = self.spec.session_id;
         let base = session_base_dir(&self.state_dir, session_id);
-        let session_dir = base.join("session");
-        let workspace_dir = base.join("workspace");
+        let data = match self.volumes.open(&self.state_dir, session_id).await {
+            Ok(d) => d,
+            Err(e) => {
+                self.finish_failed(&base, format!("{e:#}"));
+                return Ok(());
+            }
+        };
+        let session_dir = data.join("session");
+        let workspace_dir = data.join("workspace");
         std::fs::create_dir_all(&session_dir)?;
         std::fs::create_dir_all(&workspace_dir)?;
         // The guest's agent runs as uid 1000 and these were created root-owned
@@ -454,6 +467,12 @@ impl SessionActor {
         // A parked session keeps spec.json volumes for resume, but the spec
         // no longer matches a live sandbox; drop it so reconcile skips it.
         let _ = std::fs::remove_file(base.join("spec.json"));
+        // Hand the disk back so whichever host runs the next turn can open
+        // it. Before reporting the state: controld may place a resume the
+        // moment it hears the session stopped.
+        if let Err(e) = self.volumes.close(&self.state_dir, session_id).await {
+            tracing::error!(%session_id, error = format!("{e:#}"), "releasing the session disk failed");
+        }
         self.send_state(state, error);
         self.sessions.remove(session_id);
         Ok(())
@@ -469,7 +488,14 @@ impl SessionActor {
         let name = self.spec.sandbox_name.clone();
         let id = self.spec.session_id;
         let backend = self.backend.clone();
-        tokio::spawn(async move { crate::vm::remove_with_retry(backend.as_ref(), &name, id).await });
+        let volumes = self.volumes.clone();
+        let state_dir = self.state_dir.clone();
+        tokio::spawn(async move {
+            crate::vm::remove_with_retry(backend.as_ref(), &name, id).await;
+            if let Err(e) = volumes.close(&state_dir, id).await {
+                tracing::error!(session_id = %id, error = format!("{e:#}"), "releasing the session disk failed");
+            }
+        });
         self.send_state(SessionState::Failed, Some(msg));
         self.sessions.remove(self.spec.session_id);
     }
@@ -1632,6 +1658,7 @@ mod runner_kind_tests {
             uploader: crate::uploader::Uploader::new(tokio::sync::mpsc::unbounded_channel().0),
             git_tokens: crate::gitpush::GitTokens::new(tokio::sync::mpsc::unbounded_channel().0),
             backend: Arc::new(crate::vm::fake::FakeBackend::new(puku_cloud_proto::Engine::Libkrun)),
+            volumes: crate::volumes::SessionVolumes::Local,
         }
     }
 

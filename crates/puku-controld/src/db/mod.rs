@@ -21,7 +21,7 @@ const SESSION_COLS: &str = "id, org_id, user_id, worker_id, title, prompt, repo,
      cache_write_tokens, idle_timeout_s, max_duration_s, error, \
      created_at, started_at, ended_at, \
      memory_profile_id, memory_preamble, memory_opt_out, memory_ingested_at, \
-     engine, volume_worker_id";
+     engine, volume_worker_id, volume_shared";
 
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct SessionRow {
@@ -92,6 +92,8 @@ pub struct SessionRow {
     /// The worker holding this session's volumes, once any worker has
     /// reported on it. Resume must go back there -- see migration 0021.
     pub volume_worker_id: Option<Uuid>,
+    /// The disk is an RBD image on the shared cluster (migration 0033).
+    pub volume_shared: bool,
 }
 
 impl SessionRow {
@@ -221,14 +223,28 @@ pub async fn create_session(pool: &PgPool, new: NewSession) -> Result<SessionRow
 /// Record which worker holds a session's volumes, the first time any worker
 /// reports on it. Never overwritten: a stray frame from another worker must
 /// not move the pin away from the host that actually has the disk.
-pub async fn note_volume_worker(pool: &PgPool, session_id: Uuid, worker_id: Uuid) -> Result<()> {
+/// `shared`: the worker keeps session disks on the shared Ceph cluster.
+pub async fn note_volume_worker(pool: &PgPool, session_id: Uuid, worker_id: Uuid, shared: bool) -> Result<()> {
     sqlx::query(
-        "UPDATE sessions SET volume_worker_id = $2 WHERE id = $1 AND volume_worker_id IS NULL",
+        "UPDATE sessions SET volume_worker_id = $2, volume_shared = $3          WHERE id = $1 AND volume_worker_id IS NULL",
     )
     .bind(session_id)
     .bind(worker_id)
+    .bind(shared)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// A shared-disk session was placed on another host (after fencing the old
+/// one): that host is where its disk is open now. Only ever for shared
+/// disks, which is the one case where the disk really can move.
+pub async fn move_shared_volume(pool: &PgPool, session_id: Uuid, worker_id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE sessions SET volume_worker_id = $2 WHERE id = $1 AND volume_shared")
+        .bind(session_id)
+        .bind(worker_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

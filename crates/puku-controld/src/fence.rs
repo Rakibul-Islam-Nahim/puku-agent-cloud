@@ -38,7 +38,7 @@ impl AuditSink for PgAuditSink {
     }
 }
 
-/// Build the fencer for the controld instance. Wired by `start_recovery`.
+/// Build the fencer for the controld instance (shared session disks).
 pub fn build_fencer(
     volume: Arc<dyn puku_volume::VolumeBackend>,
     audit: Arc<PgAuditSink>,

@@ -7,6 +7,7 @@ mod machines;
 mod session_actor;
 mod snapshot;
 mod uploader;
+mod volumes;
 mod vm;
 
 use std::path::PathBuf;
@@ -171,6 +172,26 @@ pub struct Args {
     /// memory allows. Memory is never overcommitted.
     #[arg(long, env = "PUKU_CPU_OVERCOMMIT", default_value_t = 1.0)]
     pub cpu_overcommit: f64,
+    /// Ceph pool for session disks. Set it, and every session lives on an
+    /// RBD image of its own in this pool instead of this host's disk --
+    /// which is what lets a session move to another host when this one
+    /// dies. Unset keeps host-local directories.
+    #[arg(long, env = "PUKU_RBD_POOL")]
+    pub rbd_pool: Option<String>,
+    /// Cephx user, without `client.`.
+    #[arg(long, env = "PUKU_CEPH_USER", default_value = "puku")]
+    pub ceph_user: String,
+    #[arg(long, env = "PUKU_CEPH_CONF")]
+    pub ceph_conf: Option<String>,
+    #[arg(long, env = "PUKU_RBD_BIN", default_value = "rbd")]
+    pub rbd_bin: String,
+    /// Size of a new session disk (thin: only written blocks use space).
+    #[arg(long, env = "PUKU_RBD_SIZE_MIB", default_value_t = 20480)]
+    pub rbd_size_mib: u64,
+    /// Extra `rbd device map -o` options, comma-separated. `noshare` makes
+    /// two workers on one machine two Ceph clients, as two hosts would be.
+    #[arg(long, env = "PUKU_RBD_MAP_OPTIONS", default_value = "")]
+    pub rbd_map_options: String,
 }
 
 /// clap's stock bool parser takes only `true`/`false`, but these arrive as
@@ -224,6 +245,23 @@ impl Args {
             return split_csv(DEFAULT_EGRESS_ALLOW);
         }
         explicit
+    }
+
+    /// Where session files live: an RBD image each when a pool is set.
+    pub fn session_volumes(&self) -> volumes::SessionVolumes {
+        let Some(pool) = self.rbd_pool.clone().filter(|p| !p.trim().is_empty()) else {
+            return volumes::SessionVolumes::Local;
+        };
+        let mut cfg = puku_volume::RbdBackendConfig::new(pool.clone(), pool).with_ceph_user(self.ceph_user.clone());
+        if let Some(conf) = &self.ceph_conf {
+            cfg = cfg.with_ceph_config(conf.clone());
+        }
+        cfg.rbd_bin = self.rbd_bin.clone();
+        cfg.map_options = split_csv(&self.rbd_map_options);
+        volumes::SessionVolumes::Rbd(std::sync::Arc::new(volumes::RbdVolumes::new(
+            puku_volume::RbdBackend::new(cfg),
+            self.rbd_size_mib,
+        )))
     }
 
     pub fn secret_hosts(&self) -> Vec<String> {
@@ -441,6 +479,12 @@ mod tests {
             snapshot_zstd_level: 3,
             ch_free_page_reporting: false,
             cpu_overcommit: 1.0,
+            rbd_pool: None,
+            ceph_user: "puku".into(),
+            ceph_conf: None,
+            rbd_bin: "rbd".into(),
+            rbd_size_mib: 20480,
+            rbd_map_options: String::new(),
         }
     }
 

@@ -62,6 +62,8 @@ pub struct Link {
     /// The pool of data sockets machine traffic rides on.
     data: Arc<crate::datalink::DataLink>,
     sessions: SessionMap,
+    /// Where session files live: this host's disk, or an RBD image each.
+    volumes: crate::volumes::SessionVolumes,
     /// Shared by every session actor: presigned-URL requests and the PUTs
     /// that follow them ride the one control link.
     uploader: crate::uploader::Uploader,
@@ -92,7 +94,9 @@ impl Link {
             args.worker_token.clone(),
             machines.clone(),
         );
+        let volumes = args.session_volumes();
         Link {
+            volumes,
             args,
             backends,
             machines,
@@ -175,6 +179,7 @@ impl Link {
             uploader: self.uploader.clone(),
             git_tokens: self.git_tokens.clone(),
             backend,
+            volumes: self.volumes.clone(),
         };
         // Hub-per-task, not `configure_scope`. Scope lives on the *thread's*
         // hub, and tokio multiplexes many session actors onto each worker
@@ -214,11 +219,7 @@ impl Link {
             running_sessions: self.sessions.ids(),
             on_disk_sessions: self.on_disk_sessions(),
             engines: self.backends.engines(),
-            features: vec![
-                puku_cloud_proto::worker_proto::FEATURE_MACHINES.to_string(),
-                puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
-                puku_cloud_proto::snapshot::FEATURE_SNAPSHOTS.to_string(),
-            ],
+            features: self.features(),
             running_machines: self.machines.running_ids(),
             on_disk_machines: self.machines.on_disk_ids(),
             host: Some(self.host_report()),
@@ -440,6 +441,19 @@ impl Link {
         }
     }
 
+    fn features(&self) -> Vec<String> {
+        use puku_cloud_proto::worker_proto::{FEATURE_LEASE, FEATURE_MACHINES, FEATURE_SHARED_VOLUMES};
+        let mut f = vec![
+            FEATURE_MACHINES.to_string(),
+            FEATURE_LEASE.to_string(),
+            puku_cloud_proto::snapshot::FEATURE_SNAPSHOTS.to_string(),
+        ];
+        if self.volumes.is_shared() {
+            f.push(FEATURE_SHARED_VOLUMES.to_string());
+        }
+        f
+    }
+
     /// Every session id this worker still holds a directory for.
     fn on_disk_sessions(&self) -> Vec<Uuid> {
         let root = self.args.state_dir.join("sessions");
@@ -469,12 +483,20 @@ impl Link {
             return;
         }
         let dir = self.args.state_dir.join("sessions").join(session_id.to_string());
-        if !dir.exists() {
-            return;
-        }
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => tracing::info!(%session_id, path = %dir.display(), "reaped session volumes"),
-            Err(e) => tracing::warn!(%session_id, error = %e, "reaping session volumes failed"),
+        if self.volumes.is_shared() {
+            // The disk is in Ceph, not under `dir`: delete the image too.
+            let (volumes, state_dir) = (self.volumes.clone(), self.args.state_dir.clone());
+            tokio::spawn(async move {
+                match volumes.destroy(&state_dir, session_id).await {
+                    Ok(()) => tracing::info!(%session_id, "reaped session disk"),
+                    Err(e) => tracing::warn!(%session_id, error = format!("{e:#}"), "reaping session disk failed"),
+                }
+            });
+        } else if dir.exists() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => tracing::info!(%session_id, path = %dir.display(), "reaped session volumes"),
+                Err(e) => tracing::warn!(%session_id, error = %e, "reaping session volumes failed"),
+            }
         }
         // The volumes were only half of it. A sandbox whose teardown was
         // missed -- a boot that failed part-way, a worker killed mid-session
@@ -501,15 +523,30 @@ impl Link {
     ) {
         use puku_cloud_proto::worker_proto::ArtifactKind;
         let base = crate::session_actor::session_base_dir(&self.args.state_dir, session_id);
+        let data = self.volumes.data_dir(&self.args.state_dir, session_id);
         let src = match what {
-            ArtifactKind::Workspace => base.join("workspace"),
-            ArtifactKind::Home => base.join("session").join("home"),
+            ArtifactKind::Workspace => data.join("workspace"),
+            ArtifactKind::Home => data.join("session").join("home"),
         };
         let uploader = self.uploader.clone();
         let up_tx = self.up_tx.clone();
+        // A session that is not running here has its disk closed (on RBD):
+        // open it for the copy, and close it again after.
+        let borrow = self.volumes.is_shared() && self.sessions.get(session_id).is_none();
+        let (volumes, state_dir) = (self.volumes.clone(), self.args.state_dir.clone());
         tokio::spawn(async move {
             let dest = base.join(format!("artifact-{}.tgz", what.as_str()));
-            let error = match crate::uploader::tar_directory(&src, &dest).await {
+            let opened = if borrow { volumes.open(&state_dir, session_id).await.map(|_| ()) } else { Ok(()) };
+            let result = match opened {
+                Ok(()) => crate::uploader::tar_directory(&src, &dest).await,
+                Err(e) => Err(e),
+            };
+            if borrow {
+                if let Err(e) = volumes.close(&state_dir, session_id).await {
+                    tracing::error!(%session_id, error = format!("{e:#}"), "releasing the session disk failed");
+                }
+            }
+            let error = match result {
                 Ok(()) => {
                     uploader.upload(session_id, key.clone(), dest, "application/gzip");
                     None

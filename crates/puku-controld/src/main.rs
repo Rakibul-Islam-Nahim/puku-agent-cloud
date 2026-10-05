@@ -23,6 +23,7 @@ mod scheduler;
 mod secretbox;
 mod skills;
 mod snapshots;
+mod sharedvol;
 mod sweeper;
 mod triggers;
 mod workerlink;
@@ -48,6 +49,15 @@ struct Args {
     /// of 16 fails under load as "max clients reached".
     #[arg(long, env = "PUKU_DATABASE_MAX_CONNECTIONS", default_value_t = 16)]
     database_max_connections: u32,
+    /// Ceph pool the shared-volume workers keep session disks in. Set it,
+    /// with Ceph credentials that may run `osd blocklist`, and a session
+    /// whose host died moves to another host after that host is fenced.
+    #[arg(long, env = "PUKU_RBD_POOL")]
+    rbd_pool: Option<String>,
+    #[arg(long, env = "PUKU_CEPH_USER", default_value = "puku")]
+    ceph_user: String,
+    #[arg(long, env = "PUKU_CEPH_CONF")]
+    ceph_conf: Option<String>,
     #[arg(long, env = "PUKU_LISTEN_ADDR", default_value = "127.0.0.1:7770")]
     listen_addr: String,
     /// Shared secret workers present in Register. Read from
@@ -461,6 +471,9 @@ pub struct AppState {
     pub data: Arc<datalink::DataPool>,
     /// Signs and checks capability links.
     pub links: Arc<links::LinkSigner>,
+    /// Ceph access for sessions on shared disks; None when PUKU_RBD_POOL
+    /// is unset (those sessions then never move off a host).
+    pub shared_volumes: Option<Arc<sharedvol::SharedVolumes>>,
 }
 
 /// The capability-link key: explicit, else derived from the at-rest key,
@@ -736,6 +749,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None => tracing::info!("no skill registry (PUKU_SKILLS_URL unset); sessions get no skills"),
     }
 
+    let instance_id = Uuid::new_v4();
+    let shared_volumes = args.rbd_pool.clone().filter(|p| !p.trim().is_empty()).map(|rbd_pool| {
+        let mut cfg = puku_volume::RbdBackendConfig::new(rbd_pool.clone(), rbd_pool.clone())
+            .with_ceph_user(args.ceph_user.clone());
+        if let Some(conf) = &args.ceph_conf {
+            cfg = cfg.with_ceph_config(conf.clone());
+        }
+        let volume: Arc<dyn puku_volume::VolumeBackend> = Arc::new(puku_volume::RbdBackend::new(cfg));
+        let audit = Arc::new(fence::PgAuditSink { pool: pool.clone() });
+        tracing::info!(pool = %rbd_pool, "shared session disks on; sessions move hosts after fencing");
+        Arc::new(sharedvol::SharedVolumes {
+            pool: rbd_pool,
+            fence: fence::build_fencer(volume, audit, &instance_id.to_string()),
+        })
+    });
     let state = AppState {
         pool,
         connectors,
@@ -763,7 +791,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             default_max_turns: args.default_max_turns,
             default_disallowed_tools: split_tools(&args.default_disallowed_tools),
             default_allowed_tools: split_tools(&args.default_allowed_tools),
-            instance_id: Uuid::new_v4(),
+            instance_id,
             dev_org: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             dev_user: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
             engine_default,
@@ -782,6 +810,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         github: Arc::new(githubapp::GithubApp::from_env()),
         data: datalink::DataPool::new(),
         links: Arc::new(links_signer(args.links_secret.as_deref(), args.secret_key.as_deref())),
+        shared_volumes,
     };
 
     // Retry loop for sessions that couldn't be dispatched at creation time

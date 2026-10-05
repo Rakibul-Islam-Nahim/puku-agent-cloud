@@ -689,7 +689,10 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
             // (an engine it does not run) before creating anything, and
             // pinning to it then would strand every later resume.
             if !matches!(next, SessionState::Failed | SessionState::Canceled) {
-                db::note_volume_worker(&state.pool, session_id, worker_id).await?;
+                let shared = state.workers.get(worker_id).is_some_and(|w| {
+                    w.features.iter().any(|f| f == puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES)
+                });
+                db::note_volume_worker(&state.pool, session_id, worker_id, shared).await?;
             }
             if let Some(psid) = &puku_session_id {
                 db::set_puku_session_id(&state.pool, session_id, psid).await?;

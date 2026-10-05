@@ -18,8 +18,10 @@
 //!   failed (resumable too). One the host was handed but never started goes
 //!   back in the queue.
 //!
-//! Fencing. Today session and machine volumes are local to each worker, so
-//! no other host can attach them and there is no shared disk to cut off.
+//! Fencing. Sessions on shared disks (`sharedvol`) are fenced when they
+//! are next placed, not here: the fence goes with the move, and a session
+//! nobody resumes never needs one. Host-local session volumes and machine
+//! volumes cannot be attached by any other host: nothing to cut off.
 //! What can still double-run is a machine restored here while the old host
 //! was only partitioned; the old host's copy is stopped by the reconnect
 //! reconciliation when it comes back (the machine row names another worker
@@ -73,7 +75,7 @@ pub async fn on_host_dead(state: &AppState, host: Uuid) -> anyhow::Result<HostLo
             "sessions_stopped": report.sessions_stopped,
             "sessions_failed": report.sessions_failed,
             "sessions_requeued": report.sessions_requeued,
-            "fence": "none: volumes are host-local",
+            "fence": "on move: shared-disk sessions are fenced when next placed",
         }),
     )
     .await
@@ -119,15 +121,15 @@ async fn settle_machines(state: &AppState, host: Uuid, report: &mut HostLossRepo
 }
 
 async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossReport) -> anyhow::Result<()> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, state FROM sessions WHERE worker_id = $1 \
+    let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT id, state, volume_shared FROM sessions WHERE worker_id = $1 \
            AND state IN ('scheduled','booting','bootstrapping','running','waiting_input','stopping')",
     )
     .bind(host)
     .fetch_all(&state.pool)
     .await?;
 
-    for (id, st) in rows {
+    for (id, st, shared) in rows {
         let Some(cur) = SessionState::parse(&st) else { continue };
         let (next, reason) = match cur {
             SessionState::Scheduled => {
@@ -150,6 +152,11 @@ async fn settle_sessions(state: &AppState, host: Uuid, report: &mut HostLossRepo
             SessionState::Booting | SessionState::Bootstrapping => (
                 SessionState::Failed,
                 "the worker host was lost while this session was booting; resume to try again",
+            ),
+            _ if shared => (
+                SessionState::Stopped,
+                "the worker host running this session was lost; its disk is on shared storage, \
+                 so a resume continues on another host once the old one is fenced",
             ),
             _ => (
                 SessionState::Stopped,

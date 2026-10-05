@@ -42,6 +42,57 @@ pub struct Harness {
     pub key: Option<String>,
     /// The object store, when the harness was started with `snapshots`.
     pub s3: Option<crate::fakes3::FakeS3>,
+    /// The fence shared-disk moves go through, when started with
+    /// `shared_volumes`.
+    pub fence: Option<Arc<RecordingFence>>,
+}
+
+/// A `Fence` that records what it was asked to cut off, and can be told to
+/// refuse. Stands in for Ceph: the real blocklist is proven by
+/// `puku-volume/tests/real_ceph.rs`.
+#[derive(Default)]
+pub struct RecordingFence {
+    /// (old host, session) per `fence_volumes` call, with the volumes.
+    pub calls: std::sync::Mutex<Vec<(Uuid, Option<Uuid>, Vec<String>)>>,
+    pub refuse: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl puku_fence::Fence for RecordingFence {
+    async fn blocklist(&self, _host: Uuid) -> Result<(), puku_fence::FenceError> {
+        Ok(())
+    }
+    async fn fence(
+        &self,
+        _host: Uuid,
+        _bmc: Option<&puku_leases::BmcEndpoint>,
+    ) -> Result<puku_fence::FenceReceipt, puku_fence::FenceError> {
+        unreachable!("shared-disk moves fence volumes, not whole hosts")
+    }
+    async fn unfence(&self, _host: Uuid) -> Result<(), puku_fence::FenceError> {
+        Ok(())
+    }
+    async fn fence_volumes(
+        &self,
+        host_id: Uuid,
+        session_id: Option<Uuid>,
+        volumes: &[puku_volume::VolumeId],
+        _bmc: Option<&puku_leases::BmcEndpoint>,
+    ) -> Result<puku_fence::FenceReceipt, puku_fence::FenceError> {
+        let vols: Vec<String> = volumes.iter().map(|v| v.to_string()).collect();
+        self.calls.lock().unwrap().push((host_id, session_id, vols.clone()));
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(puku_fence::FenceError::Blocklist("refused by the test".into()));
+        }
+        Ok(puku_fence::FenceReceipt {
+            host_id,
+            blocklisted_at: chrono::Utc::now(),
+            bmc_action: None,
+            audit_log_id: 1,
+            volumes: vols,
+            clients: vec!["10.0.0.9:0/1".into()],
+        })
+    }
 }
 
 #[derive(Default)]
@@ -59,6 +110,8 @@ pub struct Opts {
     pub multi_tenant: bool,
     /// Object storage (an in-process S3) and machine snapshots on it.
     pub snapshots: bool,
+    /// Ceph access for shared session disks, through a `RecordingFence`.
+    pub shared_volumes: bool,
 }
 
 /// Every test gets its own schema, so they can run concurrently against one
@@ -108,6 +161,10 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
             Some("test-secret-key"),
         );
         Arc::new(store.unwrap().unwrap())
+    });
+    let fence = opts.shared_volumes.then(|| Arc::new(RecordingFence::default()));
+    let shared_volumes = fence.clone().map(|f| {
+        Arc::new(crate::sharedvol::SharedVolumes { pool: "puku-sessions".into(), fence: f })
     });
     let state = AppState {
         // The integration harness runs without a memory service: memory is
@@ -174,6 +231,7 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
         }),
         data: crate::datalink::DataPool::new(),
         links: Arc::new(crate::links::LinkSigner::new(b"test-links")),
+        shared_volumes,
     };
 
     // Port 0: the OS picks a free one, so tests never collide.
@@ -198,6 +256,7 @@ pub async fn start_with(opts: Opts) -> Option<Harness> {
         user,
         key,
         s3: s3.map(|(store, _)| store),
+        fence,
     })
 }
 
@@ -422,6 +481,15 @@ impl FakeWorker {
         let features = vec![
             puku_cloud_proto::worker_proto::FEATURE_MACHINES.to_string(),
             puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
+        ];
+        Self::connect_worker_with(h, name, 8, None, features).await
+    }
+
+    /// A worker whose session disks are on the shared Ceph cluster.
+    pub async fn connect_shared_worker(h: &Harness, name: &str) -> Result<Self> {
+        let features = vec![
+            puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
+            puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES.to_string(),
         ];
         Self::connect_worker_with(h, name, 8, None, features).await
     }

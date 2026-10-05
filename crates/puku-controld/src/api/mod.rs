@@ -2235,6 +2235,41 @@ async fn fail_if_volume_host_gone(
     Ok(())
 }
 
+enum SharedPlacement {
+    /// A host-local disk (or none yet): the usual pinning applies.
+    NotShared,
+    Place(Placement),
+    /// Leave it queued this tick.
+    Wait,
+}
+
+const SHARED_DISK_FEATURES: &[&str] = &[puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES];
+
+/// Where a session on a shared disk may go (see `sharedvol`): home if home
+/// is connected, anywhere on the shared cluster once home is fenced, and
+/// nowhere yet while home may still be alive.
+async fn shared_disk_placement(state: &AppState, session: &SessionRow, engine: Engine) -> anyhow::Result<SharedPlacement> {
+    let (true, Some(home)) = (session.volume_shared, session.volume_worker_id) else {
+        return Ok(SharedPlacement::NotShared);
+    };
+    if state.workers.get(home).is_some() {
+        return Ok(SharedPlacement::Place(Placement { engine, pinned: Some(home), ..Placement::default() }));
+    }
+    match crate::sharedvol::may_move(state, home).await? {
+        crate::sharedvol::MoveDecision::Wait(why) => {
+            tracing::debug!(session = %session.id, %home, "{why}");
+            Ok(SharedPlacement::Wait)
+        }
+        crate::sharedvol::MoveDecision::Move => {
+            if let Err(e) = crate::sharedvol::fence_for_move(state, home, session.id).await {
+                tracing::error!(session = %session.id, %home, error = format!("{e:#}"), "session stays queued");
+                return Ok(SharedPlacement::Wait);
+            }
+            Ok(SharedPlacement::Place(Placement { engine, features: SHARED_DISK_FEATURES, ..Placement::default() }))
+        }
+    }
+}
+
 /// Place undispatched sessions on online workers. Called after session
 /// creation, on worker registration, and from the periodic retry loop.
 pub async fn dispatch_pending(state: &AppState) -> anyhow::Result<()> {
@@ -2252,13 +2287,17 @@ pub async fn dispatch_pending(state: &AppState) -> anyhow::Result<()> {
             }
             continue;
         }
-        let placement = Placement { engine, pinned: session.volume_worker_id, ..Placement::default() };
+        let placement = match shared_disk_placement(state, &session, engine).await? {
+            SharedPlacement::NotShared => Placement { engine, pinned: session.volume_worker_id, ..Placement::default() },
+            SharedPlacement::Place(p) => p,
+            SharedPlacement::Wait => continue,
+        };
         // `continue`, not `return`: with engines and pinning in play, one
         // session nobody can take says nothing about the next. Returning here
         // let a queued Cloud Hypervisor session block every libkrun session
         // behind it until a Cloud Hypervisor worker appeared.
         let Some(worker) = state.workers.pick(&placement) else {
-            if let Some(pinned) = placement.pinned {
+            if let Some(pinned) = placement.pinned.filter(|_| !session.volume_shared) {
                 fail_if_volume_host_gone(state, &session, pinned).await?;
             }
             continue;
@@ -2280,6 +2319,9 @@ pub async fn dispatch_pending(state: &AppState) -> anyhow::Result<()> {
         // slots are gone).
         if !db::assign_worker(&state.pool, session.id, worker.worker_id).await? {
             continue;
+        }
+        if session.volume_shared && session.volume_worker_id != Some(worker.worker_id) {
+            db::move_shared_volume(&state.pool, session.id, worker.worker_id).await?;
         }
         match db::transition(&state.pool, session.id, SessionState::Scheduled, None).await {
             Ok((_, Some(ev))) => state.publish_events(&[ev]).await,

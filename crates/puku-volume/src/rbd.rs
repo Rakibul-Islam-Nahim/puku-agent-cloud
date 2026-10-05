@@ -281,6 +281,28 @@ impl RbdBackend {
     }
 
     /// Device a volume is mapped to on this host, if any.
+    /// Create an empty image for a session (no base to clone from). The
+    /// filesystem is laid down by whoever mounts it first. Idempotent.
+    pub async fn create_blank(&self, session_id: Uuid, size_mib: u64) -> Result<VolumeId, VolumeError> {
+        let vol = self.session_volume(session_id)?;
+        let size = format!("{size_mib}M");
+        let out = self.rbd(&["create", "--size", &size, vol.as_str()]).await?;
+        if !out.success() && !out.stderr.contains("File exists") {
+            return Err(Self::rejected("rbd create", &out));
+        }
+        Ok(vol)
+    }
+
+    /// Delete an image for good. Idempotent: an image already gone is fine.
+    /// Refused by Ceph while any client still has it open.
+    pub async fn remove(&self, vol: &VolumeId) -> Result<(), VolumeError> {
+        let out = self.rbd(&["rm", "--no-progress", vol.as_str()]).await?;
+        if !out.success() && !out.stderr.contains("No such file") {
+            return Err(Self::rejected("rbd rm", &out));
+        }
+        Ok(())
+    }
+
     async fn mapped_device(&self, vol: &VolumeId) -> Result<Option<String>, VolumeError> {
         let out = self.rbd(&["device", "list", "--format", "json"]).await?;
         if !out.success() {
@@ -509,6 +531,23 @@ mod tests {
             b.create(Uuid::new_v4(), &SnapId::new(VolumeId(String::new()), ""), host()).await,
             Err(VolumeError::Rejected(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn create_blank_sizes_the_image_and_is_idempotent() {
+        let (b, r) = backend(vec![CmdOutput::ok(""), CmdOutput::fail(17, "rbd: create error: (17) File exists")]);
+        let sid = Uuid::new_v4();
+        assert_eq!(b.create_blank(sid, 2048).await.unwrap().as_str(), format!("puku-sessions/{sid}"));
+        assert!(b.create_blank(sid, 2048).await.is_ok());
+        assert!(r.calls()[0].starts_with(&format!("rbd create --size 2048M puku-sessions/{sid}")));
+    }
+
+    #[tokio::test]
+    async fn remove_tolerates_a_missing_image_but_not_an_open_one() {
+        let (b, _) = backend(vec![CmdOutput::fail(2, "rbd: delete error: (2) No such file or directory")]);
+        assert!(b.remove(&VolumeId("puku-sessions/gone".into())).await.is_ok());
+        let (b, _) = backend(vec![CmdOutput::fail(16, "rbd: error: image still has watchers")]);
+        assert!(b.remove(&VolumeId("puku-sessions/open".into())).await.is_err());
     }
 
     #[tokio::test]

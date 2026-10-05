@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 puku-cloud-proto = { workspace = true }
 puku-observability = { workspace = true }
+puku-volume = { workspace = true }
 sentry = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

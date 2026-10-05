@@ -2153,3 +2153,115 @@ async fn a_silent_lease_worker_is_swept_dead_and_its_machine_settled() {
     assert!(crate::leases::handle_lease_lost(&h.state, host).await);
     machine_state_is(&h, spec.machine_id, "stopped").await;
 }
+
+// --- Sessions on shared (RBD) disks ----------------------------------------
+
+async fn shared_harness() -> Option<Harness> {
+    crate::harness::start_with(crate::harness::Opts { shared_volumes: true, ..Default::default() }).await
+}
+
+async fn volume_host(h: &Harness, id: Uuid) -> (Option<Uuid>, bool) {
+    sqlx::query_as("SELECT volume_worker_id, volume_shared FROM sessions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+}
+
+/// A session first run on a shared-disk worker, finished, with its home
+/// worker then gone.
+async fn finished_on_vanished_home(h: &Harness, home: &str) -> (Uuid, Uuid) {
+    let mut a = FakeWorker::connect_shared_worker(h, home).await.unwrap();
+    let id = create_session(h, serde_json::json!({"prompt": "first turn"})).await;
+    a.next_assignment().await.expect("assigned");
+    complete_first_turn(h, &mut a, id).await;
+    let host = worker_id_of(h, home).await;
+    assert_eq!(volume_host(h, id).await, (Some(host), true), "recorded as a shared disk");
+    drop(a);
+    until_workers_gone(h).await;
+    (id, host)
+}
+
+#[tokio::test]
+async fn a_shared_disk_session_goes_home_while_home_is_connected() {
+    let Some(h) = shared_harness().await else { return };
+    let mut home = FakeWorker::connect_shared_worker(&h, "w-shared-home").await.unwrap();
+    let id = create_session(&h, serde_json::json!({"prompt": "first turn"})).await;
+    home.next_assignment().await.expect("assigned");
+    complete_first_turn(&h, &mut home, id).await;
+    let mut other = FakeWorker::connect_shared_worker(&h, "w-shared-other").await.unwrap();
+
+    let (status, _) = h.post(&format!("/v1/sessions/{id}/input"), serde_json::json!({"text": "again"})).await;
+    assert_eq!(status, 202);
+    assert!(home.next_assignment().await.expect("home gets it").resume);
+    other.assert_no_assignment(std::time::Duration::from_secs(1)).await;
+    assert!(h.fence.as_ref().unwrap().calls.lock().unwrap().is_empty(), "no fence when nothing moves");
+}
+
+/// The point of shared disks: the home host died, so it is fenced off the
+/// disk and the session continues on another host -- at once, not after
+/// the 15-minute grace, and not as a failure.
+#[tokio::test]
+async fn a_shared_disk_session_moves_once_its_dead_host_is_fenced() {
+    let Some(h) = shared_harness().await else { return };
+    let (id, dead) = finished_on_vanished_home(&h, "w-shared-dies").await;
+    sqlx::query("UPDATE leases SET state = 'released', confirmed_dead_at = now() WHERE host_id = $1")
+        .bind(dead)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut b = FakeWorker::connect_shared_worker(&h, "w-shared-new").await.unwrap();
+
+    let (status, _) = h.post(&format!("/v1/sessions/{id}/input"), serde_json::json!({"text": "continue"})).await;
+    assert_eq!(status, 202);
+    let spec = b.next_assignment().await.expect("the session moves");
+    assert_eq!(spec.session_id, id);
+    assert!(spec.resume, "a resume on the same disk, not a fresh start");
+    let calls = h.fence.as_ref().unwrap().calls.lock().unwrap().clone();
+    assert_eq!(calls, vec![(dead, Some(id), vec![format!("puku-sessions/{id}")])], "fenced first");
+    assert_eq!(volume_host(&h, id).await.0, Some(worker_id_of(&h, "w-shared-new").await));
+}
+
+/// Home is away but not declared dead: fencing it could cut every disk a
+/// live host has open, so the session waits instead.
+#[tokio::test]
+async fn a_shared_disk_session_waits_while_its_host_may_be_alive() {
+    let Some(h) = shared_harness().await else { return };
+    let (id, _) = finished_on_vanished_home(&h, "w-shared-blip").await;
+    let mut b = FakeWorker::connect_shared_worker(&h, "w-shared-idle").await.unwrap();
+    let (status, _) = h.post(&format!("/v1/sessions/{id}/input"), serde_json::json!({"text": "continue"})).await;
+    assert_eq!(status, 202);
+    b.assert_no_assignment(std::time::Duration::from_secs(1)).await;
+    assert!(h.fence.as_ref().unwrap().calls.lock().unwrap().is_empty(), "a live host is never fenced");
+    let (_, s) = h.get(&format!("/v1/sessions/{id}")).await;
+    assert_eq!(s["state"], "scheduled", "waiting, not failed: {s}");
+}
+
+/// A fence that fails means two writers are possible: the session stays
+/// queued rather than moving.
+#[tokio::test]
+async fn a_refused_fence_keeps_the_session_where_it_is() {
+    let Some(h) = shared_harness().await else { return };
+    let (id, dead) = finished_on_vanished_home(&h, "w-shared-unfenceable").await;
+    sqlx::query("UPDATE leases SET state = 'released' WHERE host_id = $1").bind(dead).execute(&h.pool).await.unwrap();
+    h.fence.as_ref().unwrap().refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut b = FakeWorker::connect_shared_worker(&h, "w-shared-waiting").await.unwrap();
+    let (status, _) = h.post(&format!("/v1/sessions/{id}/input"), serde_json::json!({"text": "continue"})).await;
+    assert_eq!(status, 202);
+    b.assert_no_assignment(std::time::Duration::from_secs(1)).await;
+    assert!(!h.fence.as_ref().unwrap().calls.lock().unwrap().is_empty(), "the fence was tried");
+    assert_eq!(volume_host(&h, id).await.0, Some(dead), "still pinned to the old host");
+}
+
+/// A shared-disk session can only move to a worker that has the shared
+/// cluster: a host-local worker would boot it against an empty disk.
+#[tokio::test]
+async fn a_shared_disk_session_never_moves_to_a_host_local_worker() {
+    let Some(h) = shared_harness().await else { return };
+    let (id, dead) = finished_on_vanished_home(&h, "w-shared-gone").await;
+    sqlx::query("UPDATE leases SET state = 'released' WHERE host_id = $1").bind(dead).execute(&h.pool).await.unwrap();
+    let mut local = FakeWorker::connect(&h, "w-local-only", "test-worker-token").await.unwrap();
+    let (status, _) = h.post(&format!("/v1/sessions/{id}/input"), serde_json::json!({"text": "continue"})).await;
+    assert_eq!(status, 202);
+    local.assert_no_assignment(std::time::Duration::from_secs(1)).await;
+}

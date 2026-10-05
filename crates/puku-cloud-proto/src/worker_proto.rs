@@ -24,6 +24,12 @@ pub const FEATURE_MACHINES: &str = "machines";
 /// and is never declared dead by the sweeper.
 pub const FEATURE_LEASE: &str = "lease";
 
+/// Feature name a worker advertises when its session disks are RBD images
+/// on the shared Ceph cluster (`PUKU_RBD_POOL`). A session whose disk is
+/// shared can resume on any such worker, not only the one it last ran on.
+/// All workers advertising it must use the same pool.
+pub const FEATURE_SHARED_VOLUMES: &str = "shared_volumes";
+
 /// What a worker's host has, for the placement decisions controld makes
 /// before it assigns anything: whether a machine could *ever* fit here, and
 /// whether its image is staged. Every field is optional, and a field a

@@ -191,14 +191,17 @@ The table in §6 predates the code: most of the crates it lists now exist. This 
 | Recovery ordering (`controld/recovery.rs`) | Fence before any remote restore; failed fence stops recovery | Unit tests |
 | Host leases (`puku-leases`, `controld/leases.rs`, workerlink) | Worker sends `LeaseRenew` every 1 s; controld takes over on register (new generation), renews, expires on disconnect. Worker never stops its own VMs | Unit tests + controld integration tests on Postgres |
 | Lease sweeper | One instance at a time (advisory lock). Suspect at 3 s TTL, dead 15 s later, mass-loss hold above 30 % of 3+ hosts | Unit tests + Postgres integration tests (incl. lock handover) |
+| Session disks on RBD (`workerd/volumes.rs`, `PUKU_RBD_POOL`) | Each session gets an image, mapped `--exclusive`, ext4 on first use, mounted at `sessions/<id>/disk` while it runs here and released when it stops; reaping deletes the image. Worker advertises `shared_volumes` | Scripted unit tests + two real-Ceph tests: the disk follows a session between hosts; a crashed holder blocks the next host until fenced, then its synced data is there |
+| Moving a shared-disk session (`controld/sharedvol.rs`, dispatch) | Home connected → goes home, no fence. Home declared dead (lease released) → fence home off the disk, then any shared-volume worker. Home only away → waits (never fences a live host). Fence fails → stays queued | Postgres integration tests with a recording fence |
 | Dead host handling (`controld/hostloss.rs`) | Machines with a ready snapshot restored elsewhere at once, others stopped with a reason; running sessions stopped (resumable), booting ones failed, unstarted ones requeued; a returning host is told to kill what the platform stopped | Postgres integration tests, incl. sweep → dead → settled |
 
 **Not done yet, in order:**
 
-1. Session and machine volumes on RBD in workerd (`session_actor` still uses host-local directories). Until then a session cannot move hosts and there is no shared disk to fence; `hostloss.rs` says so in its audit record.
-2. Then: storage fence in front of `hostloss` restores; cold resume on the RBD head on another host; desired-state on stop; VM-crash watchdog.
-3. Encrypted memory snapshots (reuse the `snapshots.rs` data-key pipeline); S3-compatible storage (MinIO / Ceph RGW) instead of R2; drop the 5 s premium-RPO assumption.
-4. Multi-host chaos runs (two workerd processes on one box first; real hardware for BMC and 3-node Ceph).
+1. Machine volumes on RBD (machines still use host-local directories; they move by snapshot restore instead).
+2. Resume shared-disk sessions automatically after a host loss (today they are stopped and move on the next resume); desired-state on stop; VM-crash watchdog.
+3. A fenced host that comes back keeps a blocklisted Ceph client: reboot it before it rejoins (runbook item until workerd checks this itself).
+4. Encrypted memory snapshots (reuse the `snapshots.rs` data-key pipeline); S3-compatible storage (MinIO / Ceph RGW) instead of R2; drop the 5 s premium-RPO assumption.
+5. Multi-host chaos runs (two workerd processes on one box first; real hardware for BMC and 3-node Ceph).
 
 How to run the tests: `PUKU_TEST_DATABASE_URL=postgres://… cargo test --workspace` (controld integration tests skip without it); `PUKU_TEST_CEPH=1 cargo test -p puku-volume --test real_ceph` on a host with Ceph and a `client.puku` key.
 

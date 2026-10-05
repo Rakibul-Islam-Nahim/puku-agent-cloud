@@ -2711,3 +2711,17 @@ async fn real_ceph_a_deleted_disk_is_rebuilt_from_its_backups() {
     assert_eq!(got, want, "the rebuilt disk is the backed-up disk, byte for byte");
     sh(&format!("rbd snap purge --no-progress {img} --id puku; rbd rm --no-progress {img} --id puku"));
 }
+
+/// The lock connection asks Postgres to probe it every few seconds, so a
+/// controld whose machine dies does not hold the lock for hours.
+#[tokio::test]
+async fn the_lock_connection_is_probed_by_postgres() {
+    let h = harness!();
+    let mut conn = h.pool.acquire().await.unwrap().detach();
+    for stmt in crate::leases::KEEPALIVE_SQL {
+        sqlx::query(stmt).execute(&mut conn).await.unwrap();
+    }
+    let idle: String = sqlx::query_scalar("SHOW tcp_keepalives_idle").fetch_one(&mut conn).await.unwrap();
+    let count: String = sqlx::query_scalar("SHOW tcp_keepalives_count").fetch_one(&mut conn).await.unwrap();
+    assert_eq!((idle.as_str(), count.as_str()), ("5", "3"), "keepalive applies over TCP");
+}

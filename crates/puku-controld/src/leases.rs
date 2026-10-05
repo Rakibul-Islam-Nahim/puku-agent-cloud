@@ -17,6 +17,11 @@ use puku_leases::{
     BmcEndpoint, Lease, LeaseError, LeaseService, LeaseServiceImpl, LeaseState, LeaseStore, LeaseSweeper, SweepReport,
 };
 
+/// Server-side TCP keepalive for a lock connection: idle 5 s, then a probe
+/// every 2 s, dead after 3 missed (about 11 s).
+pub(crate) const KEEPALIVE_SQL: [&str; 3] =
+    ["SET tcp_keepalives_idle = 5", "SET tcp_keepalives_interval = 2", "SET tcp_keepalives_count = 3"];
+
 /// Advisory-lock key for the sweeper leader ("pukuleas").
 const SWEEPER_LOCK_KEY: i64 = 0x7075_6b75_6c65_6173;
 
@@ -207,10 +212,21 @@ impl SweepLock {
     /// Keep the lock, or try to take it. Returns whether we hold it.
     pub(crate) async fn hold(&mut self, pool: &PgPool) -> bool {
         if self.conn.is_none() {
-            match pool.acquire().await {
-                Ok(c) => self.conn = Some(c.detach()),
+            let mut c = match pool.acquire().await {
+                Ok(c) => c.detach(),
                 Err(_) => return false,
+            };
+            // If this controld's machine dies outright, Postgres only frees
+            // the lock once it notices the connection is gone -- by default
+            // after hours of TCP keepalive silence. Probe every few seconds,
+            // so another instance takes over in about 15 s. (No effect over
+            // a Unix socket, where a dead peer is noticed at once.)
+            for stmt in KEEPALIVE_SQL {
+                if let Err(e) = sqlx::query(stmt).execute(&mut c).await {
+                    tracing::warn!(error = %e, stmt, "could not set keepalive on the lock connection");
+                }
             }
+            self.conn = Some(c);
         }
         let conn = self.conn.as_mut().expect("connection just set");
         let res = if self.held {

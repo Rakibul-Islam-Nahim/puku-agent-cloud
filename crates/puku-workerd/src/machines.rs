@@ -8,6 +8,11 @@
 //! On-disk markers make a restart recoverable:
 //! * `<id>/` exists            -> this worker holds state for the machine
 //! * `<id>/spec.json` exists   -> its VM should be running; reattach to it
+//!
+//! With shared disks (`PUKU_RBD_POOL`) `<id>/` is the mountpoint of the
+//! machine's own RBD image, open here only while something needs it: a
+//! boot, a restore, a capture. So a machine whose host died can boot on
+//! another host with its volume and root disk as they were.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +53,8 @@ struct Inner {
     egress_allow: Vec<String>,
     multi_tenant: bool,
     snapshots: Snapshots,
+    /// Where `<id>/` lives: this host's disk, or an RBD image each.
+    disks: crate::volumes::MachineDisks,
     running: Mutex<HashMap<Uuid, Arc<Running>>>,
     /// One lifecycle operation per machine at a time: a stop racing a boot
     /// of the same machine must not interleave.
@@ -62,6 +69,7 @@ impl Machines {
         egress_allow: Vec<String>,
         multi_tenant: bool,
         snapshot_settings: crate::snapshot::Settings,
+        disks: crate::volumes::MachineDisks,
     ) -> Self {
         let root = state_dir.join("machines");
         Machines {
@@ -72,6 +80,7 @@ impl Machines {
                 up_tx,
                 egress_allow,
                 multi_tenant,
+                disks,
                 running: Mutex::new(HashMap::new()),
                 locks: Mutex::new(HashMap::new()),
             }),
@@ -84,6 +93,32 @@ impl Machines {
 
     fn lock(&self, id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
         self.inner.locks.lock().unwrap().entry(id).or_default().clone()
+    }
+
+    /// Open the machine's disk here (a no-op for host-local disks or one
+    /// already open). Call with the machine's lock held.
+    async fn open_disk(&self, id: Uuid) -> Result<()> {
+        self.inner.disks.open(&self.dir(id), id).await
+    }
+
+    /// Release the machine's disk once nothing reads it any more and no VM
+    /// of it runs here, so another host can open it. Shared disks only.
+    fn release_when_idle(&self, id: Uuid) {
+        if !self.inner.disks.is_shared() {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.inner.snapshots.wait_idle(id).await;
+            let lock = this.lock(id);
+            let _guard = lock.lock().await;
+            if this.get(id).is_some() {
+                return; // booted again meanwhile: the disk is in use
+            }
+            if let Err(e) = this.inner.disks.close(&this.dir(id), id).await {
+                tracing::error!(machine = %id, error = format!("{e:#}"), "releasing the machine disk failed");
+            }
+        });
     }
 
     pub fn get(&self, id: Uuid) -> Option<Arc<Running>> {
@@ -139,6 +174,12 @@ impl Machines {
             // An older boot is still up; this one supersedes it.
             self.teardown(spec.machine_id).await;
         }
+        if let Err(e) = self.open_disk(spec.machine_id).await {
+            let msg = format!("{e:#}");
+            tracing::warn!(machine = %spec.machine_id, error = %msg, "the machine's disk could not be opened");
+            self.report(&spec, MachineState::Failed, Some(msg), Some("disk_unavailable"), false);
+            return;
+        }
         if spec.restore.is_some() {
             // A capture still reading the old volume finishes before the
             // restore swaps it out from under it.
@@ -148,6 +189,7 @@ impl Machines {
                 let msg = format!("{e:#}");
                 tracing::warn!(machine = %spec.machine_id, error = %msg, "restoring the machine failed");
                 self.report(&spec, MachineState::Failed, Some(msg), Some("restore_failed"), false);
+                self.release_when_idle(spec.machine_id);
                 return;
             }
         } else {
@@ -169,6 +211,7 @@ impl Machines {
                 self.teardown(spec.machine_id).await;
                 let _ = std::fs::remove_file(self.dir(spec.machine_id).join("spec.json"));
                 self.report(&spec, MachineState::Failed, Some(msg), Some(reason), false);
+                self.release_when_idle(spec.machine_id);
             }
         }
     }
@@ -345,6 +388,11 @@ impl Machines {
             }
         }
         if let Some(order) = snapshot {
+            // A stop of a machine not running here still captures what this
+            // host has of it; on a shared disk that means opening it.
+            if let Err(e) = self.open_disk(id).await {
+                tracing::warn!(machine = %id, error = format!("{e:#}"), "opening the disk for the stop's snapshot failed");
+            }
             // Registered before the lock is released: a start queued behind
             // this stop sees the capture and waits for the root disk to be
             // read -- not for the whole upload.
@@ -352,6 +400,8 @@ impl Machines {
             let snapshots = self.inner.snapshots.clone();
             tokio::spawn(async move { snapshots.capture(order, cap, None).await });
         }
+        // After any capture, unless a boot got there first.
+        self.release_when_idle(id);
     }
 
     /// Capture a machine's disks now: live while its VM runs here, clean
@@ -359,8 +409,22 @@ impl Machines {
     pub fn snapshot(&self, order: SnapshotOrder) {
         let running = self.get(order.machine_id);
         let cap = self.inner.snapshots.begin(order.machine_id, running.is_none());
-        let snapshots = self.inner.snapshots.clone();
-        tokio::spawn(async move { snapshots.capture(order, cap, running).await });
+        let this = self.clone();
+        tokio::spawn(async move {
+            let id = order.machine_id;
+            let stopped = running.is_none();
+            if stopped && this.inner.disks.is_shared() {
+                let lock = this.lock(id);
+                let _guard = lock.lock().await;
+                if let Err(e) = this.open_disk(id).await {
+                    tracing::warn!(machine = %id, error = format!("{e:#}"), "opening the disk for a snapshot failed");
+                }
+            }
+            this.inner.snapshots.capture(order, cap, running).await;
+            if stopped {
+                this.release_when_idle(id);
+            }
+        });
     }
 
     /// Drop this worker's copy of a machine that a restore moved elsewhere --
@@ -372,7 +436,9 @@ impl Machines {
             return;
         }
         tracing::info!(machine = %id, "dropping the copy a restore replaced");
-        self.destroy(id, None).await;
+        // On a shared disk there is no separate copy here: only this host's
+        // state goes, never the image the machine now runs from elsewhere.
+        self.destroy(id, None, false).await;
     }
 
     pub fn snapshots(&self) -> &Snapshots {
@@ -381,12 +447,17 @@ impl Machines {
 
     /// Stop the VM and delete the volume -- after a last snapshot, when one
     /// was ordered, and after any capture that is already reading it.
-    pub async fn destroy(&self, id: Uuid, final_snapshot: Option<SnapshotOrder>) {
+    /// `delete_image`: the machine is destroyed upstream, so its shared
+    /// disk goes too; false drops only this host's state.
+    pub async fn destroy(&self, id: Uuid, final_snapshot: Option<SnapshotOrder>, delete_image: bool) {
         let lock = self.lock(id);
         let _guard = lock.lock().await;
         self.teardown(id).await;
         self.inner.snapshots.wait_idle(id).await;
         if let Some(order) = final_snapshot {
+            if let Err(e) = self.open_disk(id).await {
+                tracing::warn!(machine = %id, error = format!("{e:#}"), "opening the disk for the final snapshot failed");
+            }
             let cap = self.inner.snapshots.begin(id, true);
             self.inner.snapshots.capture(order, cap, None).await;
         }
@@ -396,12 +467,9 @@ impl Machines {
         for backend in self.inner.backends.all() {
             let _ = backend.remove(&name).await;
         }
-        let dir = self.dir(id);
-        if dir.exists() {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => tracing::info!(machine = %id, "machine destroyed"),
-                Err(e) => tracing::warn!(machine = %id, error = %e, "removing the machine volume failed"),
-            }
+        match self.inner.disks.remove(&self.dir(id), id, delete_image).await {
+            Ok(()) => tracing::info!(machine = %id, delete_image, "machine state removed"),
+            Err(e) => tracing::warn!(machine = %id, error = format!("{e:#}"), "removing the machine volume failed"),
         }
         self.inner.locks.lock().unwrap().remove(&id);
     }
@@ -434,6 +502,7 @@ impl Machines {
                     // marks the machine stopped.
                     tracing::info!(machine = %id, error = format!("{e:#}"), "machine VM did not survive the restart");
                     let _ = std::fs::remove_file(&spec_path);
+                    self.release_when_idle(id);
                 }
             }
         }
@@ -477,7 +546,7 @@ mod tests {
         let fake = Arc::new(crate::vm::fake::FakeBackend::new(Engine::Libkrun));
         let backends = Backends::default().with(fake.clone());
         let (tx, rx) = mpsc::unbounded_channel();
-        (Machines::new(&dir, backends, tx, vec![], false, Default::default()), fake, rx, dir)
+        (Machines::new(&dir, backends, tx, vec![], false, Default::default(), crate::volumes::MachineDisks::Local), fake, rx, dir)
     }
 
     fn states(rx: &mut mpsc::UnboundedReceiver<Up>) -> Vec<(MachineState, bool)> {
@@ -555,7 +624,7 @@ mod tests {
         let id = Uuid::new_v4();
         m.assign(spec(id, 1)).await;
         assert_eq!(m.on_disk_ids(), vec![id]);
-        m.destroy(id, None).await;
+        m.destroy(id, None, true).await;
         assert!(m.on_disk_ids().is_empty());
         assert!(m.get(id).is_none());
     }
@@ -574,7 +643,7 @@ mod tests {
 
         let (tx, _rx2) = mpsc::unbounded_channel();
         let restarted =
-            Machines::new(&dir, Backends::default().with(fake.clone()), tx, vec![], false, Default::default());
+            Machines::new(&dir, Backends::default().with(fake.clone()), tx, vec![], false, Default::default(), crate::volumes::MachineDisks::Local);
         restarted.reconcile_from_disk().await;
         assert_eq!(restarted.running_ids(), vec![alive]);
         let mut on_disk = restarted.on_disk_ids();

@@ -16,7 +16,7 @@ const MACHINE_COLS: &str = "id, org_id, user_id, external_id, name, engine, imag
     memory_mib, expose, env, entrypoint, volume, labels, idle_timeout_s, max_duration_s, \
     state, generation, worker_id, volume_worker_id, volume_existed, error, created_at, \
     started_at, stopped_at, last_active_at, last_reason, persist_root, snapshot_policy, \
-    latest_snapshot_id, restore_snapshot_id, stale_worker_id";
+    latest_snapshot_id, restore_snapshot_id, stale_worker_id, volume_shared";
 
 #[derive(Debug, Clone, FromRow)]
 pub struct MachineRow {
@@ -60,6 +60,8 @@ pub struct MachineRow {
     pub restore_snapshot_id: Option<Uuid>,
     /// A worker still holding the copy a restore replaced.
     pub stale_worker_id: Option<Uuid>,
+    /// Its disk is an RBD image on the shared cluster (migration 0034).
+    pub volume_shared: bool,
 }
 
 impl MachineRow {
@@ -544,6 +546,28 @@ pub async fn stop_lost(pool: &PgPool, worker_id: Uuid, still_running: &[Uuid]) -
     .bind(still_running)
     .fetch_all(pool)
     .await?)
+}
+
+/// The machine's first boot ran on a shared-disk worker: its disk is on
+/// the shared cluster from now on.
+pub async fn mark_shared(pool: &PgPool, id: Uuid, worker_id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE machines SET volume_shared = true WHERE id = $1 AND volume_worker_id = $2 AND NOT volume_shared")
+        .bind(id)
+        .bind(worker_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A shared-disk machine was placed on another host, after its old host was
+/// fenced: that is where its disk is open now.
+pub async fn move_shared_volume(pool: &PgPool, id: Uuid, worker_id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE machines SET volume_worker_id = $2 WHERE id = $1 AND volume_shared")
+        .bind(id)
+        .bind(worker_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Stop every live machine on a host the lease sweeper declared dead.

@@ -87,6 +87,7 @@ impl Link {
                 zstd_level: args.snapshot_zstd_level,
                 concurrency: args.snapshot_concurrency.max(1),
             },
+            args.machine_disks(),
         );
         let data = crate::datalink::DataLink::new(
             args.data_url(),
@@ -245,7 +246,10 @@ impl Link {
                         for id in reapable_machines {
                             if self.machines.get(id).is_none() {
                                 let machines = self.machines.clone();
-                                tokio::spawn(async move { machines.destroy(id, None).await });
+                                // Only this host's state: a shared disk is
+                                // deleted by an explicit destroy, never by a
+                                // reconnect's cleanup.
+                                tokio::spawn(async move { machines.destroy(id, None, false).await });
                             }
                         }
                         break resume_cursors;
@@ -361,7 +365,7 @@ impl Link {
             }
             Down::DestroyMachine { machine_id, final_snapshot } => {
                 let machines = self.machines.clone();
-                tokio::spawn(async move { machines.destroy(machine_id, final_snapshot).await });
+                tokio::spawn(async move { machines.destroy(machine_id, final_snapshot, true).await });
             }
             Down::OpenDataSockets { count } => {
                 self.data.dial(count.min(8) as usize);

@@ -2261,7 +2261,7 @@ async fn shared_disk_placement(state: &AppState, session: &SessionRow, engine: E
             Ok(SharedPlacement::Wait)
         }
         crate::sharedvol::MoveDecision::Move => {
-            if let Err(e) = crate::sharedvol::fence_for_move(state, home, session.id).await {
+            if let Err(e) = crate::sharedvol::fence_for_move(state, home, crate::sharedvol::Moving::Session(session.id)).await {
                 tracing::error!(session = %session.id, %home, error = format!("{e:#}"), "session stays queued");
                 return Ok(SharedPlacement::Wait);
             }

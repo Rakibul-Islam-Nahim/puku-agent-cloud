@@ -42,6 +42,9 @@ use crate::AppState;
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct HostLossReport {
     pub machines_restored: Vec<Uuid>,
+    /// Machines on a shared disk, queued to boot on another host (after
+    /// the dispatcher fences the dead one).
+    pub machines_moved: Vec<Uuid>,
     pub machines_stopped: Vec<Uuid>,
     pub sessions_stopped: Vec<Uuid>,
     pub sessions_failed: Vec<Uuid>,
@@ -77,6 +80,7 @@ pub async fn on_host_dead(state: &AppState, host: Uuid) -> anyhow::Result<HostLo
         &host.to_string(),
         serde_json::json!({
             "machines_restored": report.machines_restored,
+            "machines_moved": report.machines_moved,
             "machines_stopped": report.machines_stopped,
             "sessions_stopped": report.sessions_stopped,
             "sessions_failed": report.sessions_failed,
@@ -89,7 +93,7 @@ pub async fn on_host_dead(state: &AppState, host: Uuid) -> anyhow::Result<HostLo
     .ok();
     tracing::warn!(host_id = %host, ?report, "settled a dead host's machines and sessions");
 
-    if !report.machines_restored.is_empty() {
+    if !report.machines_restored.is_empty() || !report.machines_moved.is_empty() {
         crate::api::machines::dispatch_machines(state).await?;
     }
     if !report.sessions_requeued.is_empty() || !report.sessions_resumed.is_empty() {
@@ -105,6 +109,16 @@ async fn settle_machines(state: &AppState, host: Uuid, report: &mut HostLossRepo
     for (id, was) in mdb::stop_on_dead_host(&state.pool, host).await? {
         mdb::close_runs(&state.pool, id).await?;
         let wanted_running = was != "stopping";
+        let row = mdb::get(&state.pool, id).await?;
+        if wanted_running && row.as_ref().is_some_and(|m| m.volume_shared) && state.shared_volumes.is_some() {
+            // Its disk -- volume and root disk, every installed package --
+            // moves with it: no snapshot, no rollback.
+            if mdb::schedule_start(&state.pool, id).await?.is_some() {
+                tracing::warn!(machine = %id, host_id = %host, "moving a dead host's shared-disk machine");
+                report.machines_moved.push(id);
+                continue;
+            }
+        }
         let latest = if wanted_running && crate::snapshots::enabled(state) {
             sdb::latest_ready(&state.pool, id).await?
         } else {

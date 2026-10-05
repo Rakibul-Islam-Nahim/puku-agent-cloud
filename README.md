@@ -174,8 +174,17 @@ Postgres:
 | After the host goes silent | What controld does |
 | --- | --- |
 | 3 s | *suspected*: no new work goes there |
-| 15 s more | *dead*: its machines restart elsewhere from their latest snapshot (or stop, if they have none); its sessions are stopped, resumable; work it never started is requeued |
+| 15 s more | *dead*: its work is settled (below) |
 | more than 30 % of 3+ hosts silent at once | declares nobody dead and logs `MASS HOST LOSS` (likely the network, not the hosts) |
+
+What "settled" means for a dead host's work:
+
+| What it was running | With shared disks (Ceph) | Without |
+| --- | --- | --- |
+| Session mid-turn | continues on another host by itself, with a "continue where you left off" message, after the old host is fenced | stopped; a resume waits for the host |
+| Session waiting for an answer | stopped; the answer resumes it on another host | stopped; a resume waits for the host |
+| Machine | boots on another host with its own disk (volume and root disk), after the fence | restored from its latest snapshot, or stopped if it has none |
+| Work it never started | requeued | requeued |
 
 The worker never stops its own VMs when it loses controld, so a
 control-plane outage is not a data-plane outage. Only one controld instance
@@ -209,6 +218,7 @@ controld has fenced the old host off its disk.
    PUKU_CEPH_USER=puku              # default
    PUKU_CEPH_CONF=/etc/ceph/ceph.conf
    PUKU_RBD_SIZE_MIB=20480          # per session, thin-provisioned (default)
+   PUKU_RBD_MACHINE_SIZE_MIB=40960  # per machine: volume + root disk (default)
    ```
 
    workerd must run as root (it maps, formats and mounts the images). A
@@ -229,10 +239,14 @@ How a resume chooses its host:
 | away, not yet declared dead | waits: fencing a live host would cut every disk it has open |
 | fence fails | stays queued: never two writers |
 
+Machines get the same treatment: with `PUKU_RBD_POOL` set, a machine's whole
+state directory (its volume and its kept root disk, so installed packages
+too) is one RBD image, `machine-<id>`, sized by `PUKU_RBD_MACHINE_SIZE_MIB`
+(default 40960, thin). Only an explicit destroy deletes it; a worker cleaning
+up after a machine moved away never does.
+
 Operator note: a host that was fenced and comes back still has a
-blocklisted Ceph client. **Reboot it before it rejoins.** Machines (the
-generic-VM API) still keep their volumes on the host; they move by snapshot
-restore (needs object storage and `PUKU_SECRET_KEY`).
+blocklisted Ceph client. **Reboot it before it rejoins.**
 
 ### Running the tests that need real infrastructure
 
@@ -517,8 +531,9 @@ the Linux/KVM box.
 
 - **Reliability rebuild: in progress (branch `mahi`).** Host leases with a
   single-leader sweeper and mass-loss guard; a dead host's machines and
-  sessions settled automatically; session disks on Ceph RBD that move to
-  another host after the old one is fenced. Tested against Postgres and a
+  sessions settled automatically; session and machine disks on Ceph RBD
+  that move to another host after the old one is fenced, with mid-turn
+  sessions and machines resumed there on their own. Tested against Postgres and a
   real Ceph cluster; multi-host chaos runs and BMC fencing need hardware.
   Status and what is next: [`PLAN.md`](PLAN.md) section 4.
 

@@ -41,6 +41,11 @@ impl SharedVolumes {
     pub fn volume_of(&self, session_id: Uuid) -> VolumeId {
         VolumeId(format!("{}/{}", self.pool, session_id))
     }
+
+    /// A machine's image: its whole state directory (workerd `MachineDisks`).
+    pub fn machine_volume(&self, machine_id: Uuid) -> VolumeId {
+        VolumeId(format!("{}/machine-{}", self.pool, machine_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,21 +77,28 @@ pub async fn may_move(state: &AppState, home: Uuid) -> anyhow::Result<MoveDecisi
     }
 }
 
-/// Cut `home` off from the session's disk. Must succeed before the session
+/// What is being moved off a host.
+#[derive(Debug, Clone, Copy)]
+pub enum Moving {
+    Session(Uuid),
+    Machine(Uuid),
+}
+
+/// Cut `home` off from the disk of what is moving. Must succeed before it
 /// is placed anywhere else.
-pub async fn fence_for_move(state: &AppState, home: Uuid, session_id: Uuid) -> anyhow::Result<()> {
+pub async fn fence_for_move(state: &AppState, home: Uuid, what: Moving) -> anyhow::Result<()> {
     let Some(shared) = &state.shared_volumes else {
         anyhow::bail!("this control plane has no Ceph access configured (PUKU_RBD_POOL), so it cannot fence");
     };
-    let vol = shared.volume_of(session_id);
+    let (vol, session) = match what {
+        Moving::Session(id) => (shared.volume_of(id), Some(id)),
+        Moving::Machine(id) => (shared.machine_volume(id), None),
+    };
     let receipt = shared
         .fence
-        .fence_volumes(home, Some(session_id), &[vol], None)
+        .fence_volumes(home, session, std::slice::from_ref(&vol), None)
         .await
-        .map_err(|e| anyhow::anyhow!("fencing the old host off the session's disk failed: {e}"))?;
-    tracing::warn!(
-        session = %session_id, old_host = %home, clients = ?receipt.clients,
-        "fenced the old host off the session's disk; moving the session"
-    );
+        .map_err(|e| anyhow::anyhow!("fencing the old host off {vol} failed: {e}"))?;
+    tracing::warn!(?what, old_host = %home, volume = %vol, clients = ?receipt.clients, "fenced the old host off the disk; moving");
     Ok(())
 }

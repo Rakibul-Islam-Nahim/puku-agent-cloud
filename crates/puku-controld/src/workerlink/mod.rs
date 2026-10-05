@@ -875,6 +875,12 @@ async fn handle_up_frame(state: &AppState, worker_id: Uuid, frame: Up) -> anyhow
                     tracing::info!(machine = %machine_id, state = %row.state, generation, "machine state");
                     match next {
                         puku_cloud_proto::machine::MachineState::Running => {
+                            let shared = state.workers.get(worker_id).is_some_and(|w| {
+                                w.features.iter().any(|f| f == puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES)
+                            });
+                            if shared {
+                                db::machines::mark_shared(&state.pool, machine_id, worker_id).await?;
+                            }
                             db::machines::open_run(&state.pool, &row, worker_id).await?;
                             crate::snapshots::reap_stale_copy(state, &row, worker_id).await?;
                         }

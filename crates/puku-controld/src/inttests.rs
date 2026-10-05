@@ -2317,3 +2317,59 @@ async fn a_shared_disk_session_waiting_for_an_answer_is_only_stopped() {
     assert!(report.sessions_resumed.is_empty());
     h.await_state(id, &["stopped"]).await;
 }
+
+// --- Machines on shared (RBD) disks ----------------------------------------
+
+async fn machine_shared(h: &Harness, id: Uuid) -> (Option<Uuid>, bool) {
+    sqlx::query_as("SELECT volume_worker_id, volume_shared FROM machines WHERE id = $1")
+        .bind(id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+}
+
+/// A machine first booted on a shared-disk worker, whose host then dies:
+/// it boots on another host with its disk -- no snapshot, no empty volume.
+#[tokio::test]
+async fn a_dead_host_s_shared_disk_machine_boots_elsewhere_with_its_disk() {
+    let Some(h) = shared_harness().await else { return };
+    let mut a = FakeWorker::connect_shared_machine_worker(&h, "w-mshared-dies").await.unwrap();
+    let spec = running_machine(&h, &mut a, serde_json::json!({"volume": {"path": "/home/u"}})).await;
+    let dead = worker_id_of(&h, "w-mshared-dies").await;
+    assert_eq!(machine_shared(&h, spec.machine_id).await, (Some(dead), true), "recorded as a shared disk");
+    drop(a);
+    until_workers_gone(&h).await;
+    sqlx::query("UPDATE leases SET state = 'released' WHERE host_id = $1").bind(dead).execute(&h.pool).await.unwrap();
+    let mut b = FakeWorker::connect_shared_machine_worker(&h, "w-mshared-new").await.unwrap();
+
+    let report = crate::hostloss::on_host_dead(&h.state, dead).await.unwrap();
+    assert_eq!(report.machines_moved, vec![spec.machine_id], "{report:?}");
+    let moved = b.next_machine_assignment().await.expect("the survivor boots it");
+    assert_eq!(moved.machine_id, spec.machine_id);
+    assert!(moved.restore.is_none(), "its own disk, not a snapshot");
+    assert_eq!(moved.generation, spec.generation + 1);
+    let calls = h.fence.as_ref().unwrap().calls.lock().unwrap().clone();
+    assert_eq!(calls, vec![(dead, None, vec![format!("puku-sessions/machine-{}", spec.machine_id)])], "fenced first");
+    assert_eq!(machine_shared(&h, spec.machine_id).await.0, Some(worker_id_of(&h, "w-mshared-new").await));
+}
+
+/// Home is away but not declared dead: a start says so and waits, and
+/// nothing is fenced.
+#[tokio::test]
+async fn a_shared_disk_machine_waits_for_a_home_that_may_be_alive() {
+    let Some(h) = shared_harness().await else { return };
+    let mut a = FakeWorker::connect_shared_machine_worker(&h, "w-mshared-blip").await.unwrap();
+    let spec = running_machine(&h, &mut a, serde_json::json!({"volume": {"path": "/home/u"}})).await;
+    let (status, _) = h.post(&format!("/v1/machines/{}/stop", spec.machine_id), serde_json::json!({})).await;
+    assert_eq!(status, 202);
+    a.machine_state(&spec, MS::Stopped, false).await;
+    machine_state_is(&h, spec.machine_id, "stopped").await;
+    drop(a);
+    until_workers_gone(&h).await;
+    let _b = FakeWorker::connect_shared_machine_worker(&h, "w-mshared-idle").await.unwrap();
+
+    let (status, body) = h.post(&format!("/v1/machines/{}/start", spec.machine_id), serde_json::json!({})).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["reason"], "volume_host_offline");
+    assert!(h.fence.as_ref().unwrap().calls.lock().unwrap().is_empty(), "a live host is never fenced");
+}

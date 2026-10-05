@@ -71,21 +71,8 @@ impl SessionVolumes {
         let dir = self.data_dir(state_dir, session_id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let Self::Rbd(r) = self else { return Ok(dir) };
-        if r.is_mounted(&dir).await? {
-            return Ok(dir);
-        }
-        let vol = r.backend.create_blank(session_id, r.size_mib).await.context("creating the session's disk")?;
-        let dev = r.backend.attach(&vol, THIS_HOST).await.map_err(|e| {
-            anyhow::anyhow!(
-                "the session's disk {vol} could not be opened here ({e}); another host may still hold it"
-            )
-        })?;
-        let dev = dev.as_path().to_string_lossy().to_string();
-        if !r.has_filesystem(&dev).await? {
-            r.run_ok("mkfs.ext4", &["-q", "-F", "-L", "puku-session", &dev]).await?;
-        }
-        r.run_ok("mount", &["-o", "noatime", &dev, &dir.to_string_lossy()]).await?;
-        tracing::info!(%session_id, volume = %vol, device = %dev, "session disk mounted");
+        let vol = r.backend.session_volume(session_id)?;
+        r.open_image(&vol, &dir, r.size_mib, "the session's disk").await?;
         Ok(dir)
     }
 
@@ -93,14 +80,8 @@ impl SessionVolumes {
     /// unmount (which flushes) and unmap. Idempotent.
     pub async fn close(&self, state_dir: &Path, session_id: Uuid) -> Result<()> {
         let Self::Rbd(r) = self else { return Ok(()) };
-        let dir = self.data_dir(state_dir, session_id);
-        if r.is_mounted(&dir).await? {
-            r.run_ok("umount", &[&dir.to_string_lossy()]).await?;
-        }
         let vol = r.backend.session_volume(session_id)?;
-        r.backend.detach(&vol, THIS_HOST).await.with_context(|| format!("unmapping {vol}"))?;
-        tracing::info!(%session_id, volume = %vol, "session disk released");
-        Ok(())
+        r.close_image(&vol, &self.data_dir(state_dir, session_id)).await
     }
 
     /// Delete the session's files for good.
@@ -111,15 +92,100 @@ impl SessionVolumes {
             let vol: VolumeId = r.backend.session_volume(session_id)?;
             r.backend.remove(&vol).await.with_context(|| format!("deleting {vol}"))?;
         }
-        match std::fs::remove_dir_all(&base) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", base.display())),
+        remove_dir(&base)
+    }
+}
+
+fn remove_dir(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
+    }
+}
+
+/// A machine's state directory, `<state>/machines/<id>`: its volume, its
+/// kept root disk and the spec marker. On RBD the whole directory is the
+/// mounted image `machine-<id>`, so the volume *and* the root disk (the
+/// packages installed into it) move with the machine. Paths inside it are
+/// the same either way.
+#[derive(Clone)]
+pub enum MachineDisks {
+    Local,
+    Rbd { volumes: Arc<RbdVolumes>, size_mib: u64 },
+}
+
+impl MachineDisks {
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Rbd { .. })
+    }
+
+    pub fn image_name(machine_id: Uuid) -> String {
+        format!("machine-{machine_id}")
+    }
+
+    /// Make `dir` hold the machine's disk, creating it on first use.
+    /// Idempotent.
+    pub async fn open(&self, dir: &Path, machine_id: Uuid) -> Result<()> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let Self::Rbd { volumes, size_mib } = self else { return Ok(()) };
+        let vol = volumes.backend.image(&Self::image_name(machine_id))?;
+        volumes.open_image(&vol, dir, *size_mib, "the machine's disk").await
+    }
+
+    /// Release the disk from this host. Idempotent.
+    pub async fn close(&self, dir: &Path, machine_id: Uuid) -> Result<()> {
+        let Self::Rbd { volumes, .. } = self else { return Ok(()) };
+        let vol = volumes.backend.image(&Self::image_name(machine_id))?;
+        volumes.close_image(&vol, dir).await
+    }
+
+    /// Drop this host's state for the machine. The RBD image itself is
+    /// deleted only when `delete_image`: a copy-cleanup on a host the
+    /// machine moved away from must never delete the one disk it moved with.
+    pub async fn remove(&self, dir: &Path, machine_id: Uuid, delete_image: bool) -> Result<()> {
+        if let Self::Rbd { volumes, .. } = self {
+            self.close(dir, machine_id).await?;
+            if delete_image {
+                let vol = volumes.backend.image(&Self::image_name(machine_id))?;
+                volumes.backend.remove(&vol).await.with_context(|| format!("deleting {vol}"))?;
+            }
         }
+        remove_dir(dir)
     }
 }
 
 impl RbdVolumes {
+    /// Create (first time), map `--exclusive`, format (first time) and mount
+    /// `vol` at `dir`. A no-op when `dir` is already its mountpoint.
+    async fn open_image(&self, vol: &VolumeId, dir: &Path, size_mib: u64, what: &str) -> Result<()> {
+        if self.is_mounted(dir).await? {
+            return Ok(());
+        }
+        self.backend.create_image(vol, size_mib).await.with_context(|| format!("creating {what}"))?;
+        let dev = self.backend.attach(vol, THIS_HOST).await.map_err(|e| {
+            anyhow::anyhow!("{what} {vol} could not be opened here ({e}); another host may still hold it")
+        })?;
+        let dev = dev.as_path().to_string_lossy().to_string();
+        if !self.has_filesystem(&dev).await? {
+            self.run_ok("mkfs.ext4", &["-q", "-F", "-L", "puku", &dev]).await?;
+        }
+        self.run_ok("mount", &["-o", "noatime", &dev, &dir.to_string_lossy()]).await?;
+        tracing::info!(volume = %vol, device = %dev, path = %dir.display(), "disk mounted");
+        Ok(())
+    }
+
+    /// Unmount (which flushes) and unmap. Never unmaps a disk it could not
+    /// unmount. Idempotent.
+    async fn close_image(&self, vol: &VolumeId, dir: &Path) -> Result<()> {
+        if self.is_mounted(dir).await? {
+            self.run_ok("umount", &[&dir.to_string_lossy()]).await?;
+        }
+        self.backend.detach(vol, THIS_HOST).await.with_context(|| format!("unmapping {vol}"))?;
+        tracing::info!(volume = %vol, "disk released");
+        Ok(())
+    }
+
     async fn is_mounted(&self, dir: &Path) -> Result<bool> {
         let out = self.runner.run("mountpoint", &["-q".to_string(), dir.to_string_lossy().to_string()]).await?;
         Ok(out.success())
@@ -358,5 +424,58 @@ mod tests {
         b.destroy(&sb, sid).await.expect("destroy");
         rb.backend.unfence_addrs(&fenced).await.expect("unfence");
         std::fs::remove_dir_all(&sa).ok();
+    }
+
+    #[tokio::test]
+    async fn a_machine_cleanup_never_deletes_the_shared_image() {
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            CmdOutput::fail(32, ""),   // mountpoint: not mounted
+            CmdOutput::ok("[]"),       // rbd device list: not mapped
+        ]));
+        let backend = RbdBackend::with_runner(RbdBackendConfig::new("p", "p"), runner.clone());
+        let disks = MachineDisks::Rbd {
+            volumes: Arc::new(RbdVolumes { backend, size_mib: 1, runner: runner.clone() }),
+            size_mib: 1,
+        };
+        let dir = std::env::temp_dir().join(format!("puku-m-{}", Uuid::new_v4()));
+        disks.remove(&dir, Uuid::new_v4(), false).await.unwrap();
+        assert!(!r_has(&runner, "rbd rm"), "{:?}", runner.calls());
+    }
+
+    fn r_has(r: &ScriptedRunner, prefix: &str) -> bool {
+        r.calls().iter().any(|c| c.starts_with(prefix))
+    }
+
+    /// A machine's volume and its kept root disk move together.
+    #[tokio::test]
+    async fn real_ceph_a_machine_disk_moves_with_its_volume_and_root_disk() {
+        if !real_enabled() {
+            return;
+        }
+        let host = || {
+            let cfg = RbdBackendConfig::new("puku-sessions", "puku-sessions").with_map_options(&["noshare"]);
+            MachineDisks::Rbd { volumes: Arc::new(RbdVolumes::new(RbdBackend::new(cfg), 256)), size_mib: 256 }
+        };
+        let (a, b) = (host(), host());
+        let id = Uuid::new_v4();
+        let (da, db) = (state_dir("ma").join(id.to_string()), state_dir("mb").join(id.to_string()));
+
+        a.open(&da, id).await.expect("open on A");
+        std::fs::create_dir_all(da.join("volume")).unwrap();
+        std::fs::write(da.join("volume/notes.txt"), "user files").unwrap();
+        std::fs::write(da.join("root.image"), "pukubot-computer:latest").unwrap();
+        a.close(&da, id).await.expect("close on A");
+
+        b.open(&db, id).await.expect("open on B");
+        assert_eq!(std::fs::read_to_string(db.join("volume/notes.txt")).unwrap(), "user files");
+        assert_eq!(std::fs::read_to_string(db.join("root.image")).unwrap(), "pukubot-computer:latest");
+        b.close(&db, id).await.unwrap();
+
+        // A's cleanup of its old state leaves the image alone...
+        a.remove(&da, id, false).await.unwrap();
+        assert_eq!(sh(&format!("rbd info puku-sessions/machine-{id} --id puku")).0, 0, "image kept");
+        // ...an explicit destroy deletes it.
+        b.remove(&db, id, true).await.unwrap();
+        assert_ne!(sh(&format!("rbd info puku-sessions/machine-{id} --id puku")).0, 0, "image deleted");
     }
 }

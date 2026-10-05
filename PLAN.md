@@ -193,12 +193,14 @@ The table in §6 predates the code: most of the crates it lists now exist. This 
 | Lease sweeper | One instance at a time (advisory lock). Suspect at 3 s TTL, dead 15 s later, mass-loss hold above 30 % of 3+ hosts | Unit tests + Postgres integration tests (incl. lock handover) |
 | Session disks on RBD (`workerd/volumes.rs`, `PUKU_RBD_POOL`) | Each session gets an image, mapped `--exclusive`, ext4 on first use, mounted at `sessions/<id>/disk` while it runs here and released when it stops; reaping deletes the image. Worker advertises `shared_volumes` | Scripted unit tests + two real-Ceph tests: the disk follows a session between hosts; a crashed holder blocks the next host until fenced, then its synced data is there |
 | Moving a shared-disk session (`controld/sharedvol.rs`, dispatch) | Home connected → goes home, no fence. Home declared dead (lease released) → fence home off the disk, then any shared-volume worker. Home only away → waits (never fences a live host). Fence fails → stays queued | Postgres integration tests with a recording fence |
+| Machine disks on RBD (`workerd/volumes.rs` `MachineDisks`, migration 0034) | A machine's whole state directory (volume + kept root disk, so installed packages too) is one RBD image, open only while a boot, restore or capture needs it. Home dead → fenced, then boots on any shared-disk worker with its disk (no snapshot). A copy-cleanup never deletes the shared image; only an explicit destroy does | Scripted test + real-Ceph test (volume and root disk move together; cleanup keeps the image) + Postgres integration tests |
+| Auto-resume after a host dies | A shared-disk session that was mid-turn is queued again at once with a "continue where you left off" message; shared-disk machines are restarted elsewhere | Postgres integration tests |
 | Dead host handling (`controld/hostloss.rs`) | Machines with a ready snapshot restored elsewhere at once, others stopped with a reason; running sessions stopped (resumable), booting ones failed, unstarted ones requeued; a returning host is told to kill what the platform stopped | Postgres integration tests, incl. sweep → dead → settled |
 
 **Not done yet, in order:**
 
-1. Machine volumes on RBD (machines still use host-local directories; they move by snapshot restore instead).
-2. Resume shared-disk sessions automatically after a host loss (today they are stopped and move on the next resume); desired-state on stop; VM-crash watchdog.
+1. Desired-state on stop; VM-crash watchdog (a VM that dies while its host stays up).
+2. Auto-resume of a session that was waiting for an answer (today it waits for the answer).
 3. A fenced host that comes back keeps a blocklisted Ceph client: reboot it before it rejoins (runbook item until workerd checks this itself).
 4. Encrypted memory snapshots (reuse the `snapshots.rs` data-key pipeline); S3-compatible storage (MinIO / Ceph RGW) instead of R2; drop the 5 s premium-RPO assumption.
 5. Multi-host chaos runs (two workerd processes on one box first; real hardware for BMC and 3-node Ceph).

@@ -41,6 +41,10 @@ const MIN_FREE_DISK_MIB: u64 = 1024;
 /// What a worker must run to boot a machine, and to boot one from a snapshot.
 const MACHINE_FEATURES: &[&str] = &[FEATURE_MACHINES];
 const RESTORE_FEATURES: &[&str] = &[FEATURE_MACHINES, FEATURE_SNAPSHOTS];
+/// What a machine on a shared disk needs: its disk is only reachable from
+/// workers on the same cluster.
+const SHARED_DISK_FEATURES: &[&str] =
+    &[FEATURE_MACHINES, puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES];
 
 /// Routes behind the api-key middleware.
 pub fn protected() -> Router<AppState> {
@@ -1154,7 +1158,21 @@ fn row_placement(m: &MachineRow) -> Placement {
     // reports as `restored_from`), so only a boot still waiting to be placed
     // is actually restoring.
     let restoring = m.restore_snapshot_id.is_some() && m.machine_state() == MachineState::Scheduled;
-    placement_for(m.engine(), m.cpus, m.memory_mib, &m.image, m.volume_worker_id, restoring)
+    let mut p = placement_for(m.engine(), m.cpus, m.memory_mib, &m.image, m.volume_worker_id, restoring);
+    if m.volume_shared && !restoring {
+        p.features = SHARED_DISK_FEATURES;
+    }
+    p
+}
+
+/// A machine on a shared disk whose home host is not connected: whether it
+/// may leave home (see `sharedvol::may_move`).
+async fn shared_home_released(state: &AppState, m: &MachineRow) -> anyhow::Result<bool> {
+    let (true, Some(home)) = (m.volume_shared, m.volume_worker_id) else { return Ok(false) };
+    if state.workers.get(home).is_some() {
+        return Ok(false);
+    }
+    Ok(crate::sharedvol::may_move(state, home).await? == crate::sharedvol::MoveDecision::Move)
 }
 
 /// Why nobody took a placement `pick` just failed on.
@@ -1179,6 +1197,16 @@ async fn placeable(state: &AppState, m: &mut MachineRow, relocate: bool) -> anyh
     let Err(Unplaceable::VolumeHostOffline { worker_id }) = first else {
         return Ok(first.map(|()| Start::InPlace));
     };
+    if m.volume_shared {
+        // Its disk moves with it once home is fenced (the dispatcher fences);
+        // until home may be fenced, it waits for home.
+        if !shared_home_released(state, m).await? {
+            return Ok(Err(Unplaceable::VolumeHostOffline { worker_id }));
+        }
+        let mut anywhere = row_placement(m);
+        anywhere.pinned = None;
+        return Ok(state.workers.diagnose(&anywhere).map(|()| Start::InPlace));
+    }
     let gone = host_gone_past_grace(state, worker_id).await?;
     let latest = if crate::snapshots::enabled(state) { sdb::latest_ready(&state.pool, m.id).await? } else { None };
     match latest {
@@ -1203,6 +1231,15 @@ async fn placeable(state: &AppState, m: &mut MachineRow, relocate: bool) -> anyh
 /// nothing left to place.
 async fn dispatch_one(state: &AppState, m: &MachineRow) -> anyhow::Result<Result<(), Unplaceable>> {
     let mut m = m.clone();
+    let home = m.volume_worker_id;
+    if shared_home_released(state, &m).await? {
+        let Some(old) = home else { unreachable!("released implies a home") };
+        if let Err(e) = crate::sharedvol::fence_for_move(state, old, crate::sharedvol::Moving::Machine(m.id)).await {
+            tracing::error!(machine = %m.id, home = %old, error = format!("{e:#}"), "machine stays queued");
+            return Ok(Err(Unplaceable::VolumeHostOffline { worker_id: old }));
+        }
+        m.volume_worker_id = None;
+    }
     let worker = loop {
         let placement = row_placement(&m);
         if let Some(w) = state.workers.pick(&placement) {
@@ -1211,7 +1248,9 @@ async fn dispatch_one(state: &AppState, m: &MachineRow) -> anyhow::Result<Result
         // A restore pinned to a worker waits for that worker; a boot pinned
         // to its volume waits for its volume host, until the grace is up.
         let Some(pinned) = m.volume_worker_id else { return Ok(Err(nobody(state, &placement))) };
-        if m.restore_snapshot_id.is_some() || !host_gone_past_grace(state, pinned).await? {
+        // A shared disk waits for its home, or moves only through the fence
+        // above -- never to an empty volume or a snapshot behind its back.
+        if m.volume_shared || m.restore_snapshot_id.is_some() || !host_gone_past_grace(state, pinned).await? {
             return Ok(Err(nobody(state, &placement)));
         }
         let latest = if crate::snapshots::enabled(state) { sdb::latest_ready(&state.pool, m.id).await? } else { None };
@@ -1233,6 +1272,9 @@ async fn dispatch_one(state: &AppState, m: &MachineRow) -> anyhow::Result<Result
     };
     if !mdb::assign_worker(&state.pool, m.id, worker.worker_id, m.generation).await? {
         return Ok(Ok(()));
+    }
+    if m.volume_shared && home != Some(worker.worker_id) {
+        mdb::move_shared_volume(&state.pool, m.id, worker.worker_id).await?;
     }
     let spec = match machine_spec(state, &m).await {
         Ok(spec) => spec,

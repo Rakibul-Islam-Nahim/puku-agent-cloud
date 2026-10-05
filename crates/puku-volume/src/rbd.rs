@@ -285,12 +285,23 @@ impl RbdBackend {
     /// filesystem is laid down by whoever mounts it first. Idempotent.
     pub async fn create_blank(&self, session_id: Uuid, size_mib: u64) -> Result<VolumeId, VolumeError> {
         let vol = self.session_volume(session_id)?;
+        self.create_image(&vol, size_mib).await?;
+        Ok(vol)
+    }
+
+    /// An image in the sessions pool by name (machines use `machine-<id>`).
+    pub fn image(&self, name: &str) -> Result<VolumeId, VolumeError> {
+        Ok(VolumeId(format!("{}/{}", self.cfg()?.pool_sessions, name)))
+    }
+
+    /// Create an empty image of `size_mib`. Idempotent.
+    pub async fn create_image(&self, vol: &VolumeId, size_mib: u64) -> Result<(), VolumeError> {
         let size = format!("{size_mib}M");
         let out = self.rbd(&["create", "--size", &size, vol.as_str()]).await?;
         if !out.success() && !out.stderr.contains("File exists") {
             return Err(Self::rejected("rbd create", &out));
         }
-        Ok(vol)
+        Ok(())
     }
 
     /// Delete an image for good. Idempotent: an image already gone is fine.

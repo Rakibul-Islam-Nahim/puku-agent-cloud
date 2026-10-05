@@ -188,6 +188,10 @@ pub struct Args {
     /// Size of a new session disk (thin: only written blocks use space).
     #[arg(long, env = "PUKU_RBD_SIZE_MIB", default_value_t = 20480)]
     pub rbd_size_mib: u64,
+    /// Size of a new machine disk: its volume plus its kept root disk
+    /// (thin: only written blocks use space).
+    #[arg(long, env = "PUKU_RBD_MACHINE_SIZE_MIB", default_value_t = 40960)]
+    pub rbd_machine_size_mib: u64,
     /// Extra `rbd device map -o` options, comma-separated. `noshare` makes
     /// two workers on one machine two Ceph clients, as two hosts would be.
     #[arg(long, env = "PUKU_RBD_MAP_OPTIONS", default_value = "")]
@@ -247,21 +251,31 @@ impl Args {
         explicit
     }
 
-    /// Where session files live: an RBD image each when a pool is set.
-    pub fn session_volumes(&self) -> volumes::SessionVolumes {
-        let Some(pool) = self.rbd_pool.clone().filter(|p| !p.trim().is_empty()) else {
-            return volumes::SessionVolumes::Local;
-        };
+    fn rbd_volumes(&self, size_mib: u64) -> Option<std::sync::Arc<volumes::RbdVolumes>> {
+        let pool = self.rbd_pool.clone().filter(|p| !p.trim().is_empty())?;
         let mut cfg = puku_volume::RbdBackendConfig::new(pool.clone(), pool).with_ceph_user(self.ceph_user.clone());
         if let Some(conf) = &self.ceph_conf {
             cfg = cfg.with_ceph_config(conf.clone());
         }
         cfg.rbd_bin = self.rbd_bin.clone();
         cfg.map_options = split_csv(&self.rbd_map_options);
-        volumes::SessionVolumes::Rbd(std::sync::Arc::new(volumes::RbdVolumes::new(
-            puku_volume::RbdBackend::new(cfg),
-            self.rbd_size_mib,
-        )))
+        Some(std::sync::Arc::new(volumes::RbdVolumes::new(puku_volume::RbdBackend::new(cfg), size_mib)))
+    }
+
+    /// Where machine state lives: an RBD image each when a pool is set.
+    pub fn machine_disks(&self) -> volumes::MachineDisks {
+        match self.rbd_volumes(self.rbd_machine_size_mib) {
+            Some(v) => volumes::MachineDisks::Rbd { size_mib: self.rbd_machine_size_mib, volumes: v },
+            None => volumes::MachineDisks::Local,
+        }
+    }
+
+    /// Where session files live: an RBD image each when a pool is set.
+    pub fn session_volumes(&self) -> volumes::SessionVolumes {
+        match self.rbd_volumes(self.rbd_size_mib) {
+            Some(v) => volumes::SessionVolumes::Rbd(v),
+            None => volumes::SessionVolumes::Local,
+        }
     }
 
     pub fn secret_hosts(&self) -> Vec<String> {
@@ -484,6 +498,7 @@ mod tests {
             ceph_conf: None,
             rbd_bin: "rbd".into(),
             rbd_size_mib: 20480,
+            rbd_machine_size_mib: 40960,
             rbd_map_options: String::new(),
         }
     }

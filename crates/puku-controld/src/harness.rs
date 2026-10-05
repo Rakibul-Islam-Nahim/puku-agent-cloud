@@ -494,6 +494,16 @@ impl FakeWorker {
         Self::connect_worker_with(h, name, 8, None, features).await
     }
 
+    /// A machines worker whose machine disks are on the shared cluster.
+    pub async fn connect_shared_machine_worker(h: &Harness, name: &str) -> Result<Self> {
+        let features = vec![
+            puku_cloud_proto::worker_proto::FEATURE_MACHINES.to_string(),
+            puku_cloud_proto::worker_proto::FEATURE_LEASE.to_string(),
+            puku_cloud_proto::worker_proto::FEATURE_SHARED_VOLUMES.to_string(),
+        ];
+        Self::connect_worker_with(h, name, 8, None, features).await
+    }
+
     /// A worker that runs machines and snapshots them.
     pub async fn connect_snapshot_worker(h: &Harness, name: &str) -> Result<Self> {
         let features = vec![

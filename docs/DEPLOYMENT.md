@@ -161,12 +161,13 @@ docker run -d --name minio --restart unless-stopped \
   -v /var/lib/minio:/data \
   -e MINIO_ROOT_USER=puku \
   -e MINIO_ROOT_PASSWORD='<a password, 8+ chars>' \
-  quay.io/minio/minio server /data --console-address ':9001'
+  docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z server /data --console-address ':9001'
 ```
 
-The images come from quay.io: MinIO no longer publishes `minio/minio` or
-`minio/mc` on Docker Hub, and pulling either there fails with "repository
-does not exist".
+MinIO no longer publishes images: `quay.io/minio/*` and `docker.io/minio/*`
+both refuse anonymous pulls. `pgsty/minio` and `pgsty/mc` are Pigsty's
+community builds of MinIO, pinned to a release here;
+`cgr.dev/chainguard/minio` is the other maintained build (latest only).
 
 **Mount a volume.** Without `-v`, everything lives in the container's
 writable layer and one `docker rm minio` destroys every transcript,
@@ -177,7 +178,7 @@ Create the two buckets — MinIO does not create them on demand:
 ```bash
 # --entrypoint sh is required: the image's entrypoint is `mc` itself, so a
 # bare `sh -c` arrives as arguments to mc.
-docker run --rm --network host --entrypoint sh quay.io/minio/mc -c "
+docker run --rm --network host --entrypoint sh docker.io/pgsty/mc:RELEASE.2026-09-16T00-00-00Z -c "
   mc alias set local http://127.0.0.1:9000 puku '<the password>' &&
   mc mb -p local/puku-skills local/puku-agent-cloud &&
   mc ls local"

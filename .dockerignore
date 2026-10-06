@@ -1,3 +1,6 @@
-target/
-puku-archive/
 .git/
+target/
+**/target/
+.env
+.env.*
+!.env.example

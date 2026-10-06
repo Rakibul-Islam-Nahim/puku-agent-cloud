@@ -1,0 +1,50 @@
+# puku-workerd in a container: the libkrun (microsandbox) engine only.
+#
+# It runs privileged with the host's network (docker-compose.yml, profile
+# `worker`): libkrun VMs need /dev/kvm, and a session on a shared disk needs
+# `rbd device map`, mkfs and mount.
+#
+# Two things differ from the systemd unit, both because the VMs live inside
+# this container:
+#   - Recreating or restarting the container stops its VMs. When the worker
+#     reconnects, controld marks its machines stopped (the next start boots
+#     them) and restarts its mid-task sessions on their own disks, like a VM
+#     crash. The systemd unit (KillMode=process) keeps VMs alive instead.
+#   - Cloud Hypervisor is off: each of its VMs is a transient systemd unit on
+#     the host. A Cloud Hypervisor worker runs on the host
+#     (deploy/scripts/setup-worker.sh) and joins the same controld.
+
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libcap-ng-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Cache mounts keep the registry and the target dir between builds, so a
+# source edit recompiles only what changed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p puku-workerd \
+ && cp target/release/puku-workerd /usr/local/bin/puku-workerd
+
+FROM ubuntu:24.04
+# ceph-common: rbd for shared disks. e2fsprogs/util-linux: mkfs.ext4 and
+# mount for them. kmod: modprobe rbd. git: the host-side branch push.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar git ceph-common e2fsprogs util-linux kmod \
+    iproute2 procps libcap-ng0 \
+ && rm -rf /var/lib/apt/lists/*
+COPY deploy/scripts/prestage-msb.sh deploy/scripts/preflight.sh /opt/puku/bin/
+RUN /opt/puku/bin/prestage-msb.sh
+COPY --from=build /usr/local/bin/puku-workerd /usr/local/bin/puku-workerd
+# The toolchain is in the image; msb's state (images, sandboxes) lives under
+# PUKU_MSB_HOME on the state volume, so it survives a new image.
+ENV MSB_PATH=/opt/puku/msb/bin/msb \
+    MSB_LIBKRUNFW_PATH=/opt/puku/msb/lib/libkrunfw.so \
+    PATH=/opt/puku/msb/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PUKU_STATE_DIR=/var/lib/puku \
+    PUKU_MSB_HOME=/var/lib/puku/msb \
+    MSB_HOME=/var/lib/puku/msb \
+    PUKU_ENGINE_LIBKRUN=true \
+    PUKU_ENGINE_CLOUD_HYPERVISOR=false
+# The same checks the systemd unit runs before it starts workerd.
+ENTRYPOINT ["/bin/sh", "-c", "modprobe rbd 2>/dev/null; /opt/puku/bin/preflight.sh && exec /usr/local/bin/puku-workerd"]

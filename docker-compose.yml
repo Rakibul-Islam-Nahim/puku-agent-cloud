@@ -1,0 +1,243 @@
+# puku-agent-cloud, every service in a container.
+#
+#   ./deploy/scripts/stack-init.sh   # once: writes .env with fresh secrets
+#   nano .env                        # the keys only you have (memory, skills, tunnel)
+#   docker compose up -d
+#
+# COMPOSE_PROFILES in .env picks what runs on this host:
+#   control  controld, Postgres, MinIO          (the main server)
+#   tunnel   cloudflared: agent.api.puku.sh     (the main server)
+#   worker   workerd with libkrun VMs           (every server that runs VMs)
+# e.g. COMPOSE_PROFILES=control,tunnel,worker on the main server and
+# COMPOSE_PROFILES=worker on a second one. Full guide: docs/DOCKER-STACK.md.
+#
+# Ceph is not in here: cephadm runs its daemons in containers of its own.
+# Settings with no default below are passed only when .env sets them, so
+# controld keeps its own default; leave optional ones commented out in .env
+# (an uncommented `KEY=` passes an empty string, which typed settings reject).
+
+# Not `puku-cloud`, the deploy/bm stack's name: on a host still running that
+# stack, `up` here then fails on the busy port instead of quietly replacing
+# its containers.
+name: puku-agent-cloud
+
+services:
+  postgres:
+    image: postgres:17
+    profiles: [control]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: puku
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: puku_cloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U puku -d puku_cloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Object storage: event payloads, archives, machine snapshots, disk backups.
+  # Workers and clients upload and download through presigned URLs, so the
+  # endpoint controld signs (PUKU_R2_ENDPOINT) must be an address all of them
+  # reach: this host's LAN address, not `minio` or 127.0.0.1.
+  #
+  # MinIO no longer publishes images: quay.io/minio/* and docker.io/minio/*
+  # refuse anonymous pulls. pgsty/* are Pigsty's community builds of MinIO,
+  # pinned to a release; cgr.dev/chainguard/minio is the other maintained
+  # build (latest only). MINIO_IMAGE / MC_IMAGE swap them.
+  minio:
+    image: ${MINIO_IMAGE:-docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    profiles: [control]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-puku-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
+    ports:
+      - "${MINIO_BIND:-127.0.0.1}:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      # A named volume by default; set MINIO_DATA to a host path (a disk of
+      # its own, not the Ceph disk) to keep backups there instead.
+      - ${MINIO_DATA:-miniodata}:/data
+
+  # Makes the bucket and controld's own access key, then exits. Safe to run
+  # on every `up`.
+  minio-init:
+    image: ${MC_IMAGE:-docker.io/pgsty/mc:RELEASE.2026-09-16T00-00-00Z}
+    profiles: [control]
+    depends_on: [minio]
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-puku-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
+      BUCKET: ${PUKU_R2_BUCKET:-puku-agent-cloud}
+      KEY: ${PUKU_R2_ACCESS_KEY_ID:-puku-cloud}
+      SECRET: ${PUKU_R2_SECRET_ACCESS_KEY:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        i=0
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+          i=$$((i + 1)); [ "$$i" -lt 60 ] || { echo "MinIO did not come up"; exit 1; }; sleep 1
+        done
+        mc mb --ignore-existing "local/$$BUCKET"
+        mc admin user add local "$$KEY" "$$SECRET" >/dev/null
+        mc admin policy attach local readwrite --user "$$KEY" >/dev/null 2>&1 || true
+        echo "bucket $$BUCKET and key $$KEY ready"
+
+  controld:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CONTROLD_IMAGE:-puku-controld:local}
+    profiles: [control]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Hex passwords only (stack-init.sh makes them): it sits in a URL.
+      PUKU_DATABASE_URL: postgres://puku:${POSTGRES_PASSWORD:-}@postgres:5432/puku_cloud
+      PUKU_DATABASE_MAX_CONNECTIONS:
+      PUKU_LISTEN_ADDR: 0.0.0.0:7770
+      PUKU_SECRET_KEY: ${PUKU_SECRET_KEY:-}
+      # Identity. `required` everywhere this is reachable: the code's default
+      # (`off`) makes every caller the same admin.
+      PUKU_AUTH: ${PUKU_AUTH:-required}
+      PUKU_API_URL: ${PUKU_API_URL:-https://chat.api.puku.sh}
+      PUKU_PLATFORM_AUTH: ${PUKU_PLATFORM_AUTH:-true}
+      PUKU_AUTH_ISSUER:
+      # Workers join with their own tokens (gen-worker-token), never a shared one.
+      PUKU_ALLOW_SHARED_WORKER_TOKEN: "false"
+      # Puku services this controld calls.
+      PUKU_MEMORY_URL: ${PUKU_MEMORY_URL:-https://memory.api.puku.sh}
+      PUKU_MEMORY_SERVICE_KEY: ${PUKU_MEMORY_SERVICE_KEY:-}
+      PUKU_MEMORY_ACCESS_CLIENT_ID: ${PUKU_MEMORY_ACCESS_CLIENT_ID:-}
+      PUKU_MEMORY_ACCESS_CLIENT_SECRET: ${PUKU_MEMORY_ACCESS_CLIENT_SECRET:-}
+      PUKU_SKILLS_URL: ${PUKU_SKILLS_URL:-https://skill.api.puku.sh}
+      PUKU_SKILLS_TOKEN: ${PUKU_SKILLS_TOKEN:-}
+      PUKU_MCP_PROXY_URL: ${PUKU_MCP_PROXY_URL:-https://mcp.proxy.puku.sh}
+      PUKU_AI_BASE_URL:
+      # Machines (puku-bot computers) and their links.
+      PUKU_LINKS_URL: ${PUKU_LINKS_URL:-http://controld:7770}
+      PUKU_LINKS_SECRET:
+      PUKU_ENGINES_ALLOWED:
+      PUKU_ENGINE_DEFAULT:
+      PUKU_AGENT_IMAGE:
+      PUKU_MACHINE_IMAGE:
+      PUKU_MACHINE_MAX_CPUS:
+      PUKU_MACHINE_MAX_MEMORY_MIB:
+      PUKU_SNAPSHOTS:
+      PUKU_SNAPSHOT_KEEP:
+      PUKU_SNAPSHOT_RETAIN_DESTROYED_DAYS:
+      # Object storage: MinIO above (the PUKU_R2_* names are historical).
+      PUKU_R2_ENDPOINT: ${PUKU_R2_ENDPOINT:-}
+      PUKU_R2_BUCKET: ${PUKU_R2_BUCKET:-puku-agent-cloud}
+      PUKU_R2_REGION: ${PUKU_R2_REGION:-us-east-1}
+      PUKU_R2_ACCESS_KEY_ID: ${PUKU_R2_ACCESS_KEY_ID:-puku-cloud}
+      PUKU_R2_SECRET_ACCESS_KEY: ${PUKU_R2_SECRET_ACCESS_KEY:-}
+      # Shared disks on Ceph: fencing, storage cleanup, disk backups.
+      PUKU_RBD_POOL:
+      PUKU_CEPH_USER: ${PUKU_CEPH_USER:-puku}
+      PUKU_CEPH_CONF: /etc/ceph/ceph.conf
+      PUKU_STORAGE_GC_S:
+      PUKU_STORAGE_GC_GRACE_S:
+      PUKU_STORAGE_GC_DRY_RUN:
+      PUKU_DISK_BACKUP:
+      PUKU_DISK_BACKUP_INTERVAL_S:
+      # Session policy.
+      PUKU_PERMISSION_CEILING:
+      PUKU_DEFAULT_MAX_TURNS:
+      PUKU_DEFAULT_DISALLOWED_TOOLS:
+      PUKU_DEFAULT_ALLOWED_TOOLS:
+      PUKU_RETENTION_DAYS:
+      PUKU_ALLOW_OPERATOR_CREDENTIALS:
+      PUKU_AI_API_KEY:
+      PUKU_GIT_TOKEN:
+      SENTRY_DSN:
+      SENTRY_ENVIRONMENT:
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # Workers dial in here. 127.0.0.1 when the only worker is on this host;
+      # this host's LAN address when other servers run workers too.
+      - "${CONTROLD_BIND:-127.0.0.1}:7770:7770"
+    volumes:
+      - controld-data:/var/lib/puku
+      # Ceph config and the client.puku keyring (readable by uid/gid 10001).
+      - ${CEPH_CONF_DIR:-/etc/ceph}:/etc/ceph:ro
+    networks:
+      - default
+      # Shared with puku-bot when it runs on this host, so it reaches
+      # controld as http://controld:7770.
+      - link
+
+  # The public door: agent.api.puku.sh -> http://controld:7770, set as the
+  # tunnel's public hostname in Cloudflare.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    depends_on:
+      controld:
+        condition: service_healthy
+        required: false
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+
+  # The worker. libkrun only; see Dockerfile.workerd for what differs from
+  # the systemd unit.
+  workerd:
+    build:
+      context: .
+      dockerfile: Dockerfile.workerd
+    image: ${WORKERD_IMAGE:-puku-workerd:local}
+    profiles: [worker]
+    restart: unless-stopped
+    # /dev/kvm for the VMs; rbd device map, mkfs and mount for shared disks.
+    privileged: true
+    # libkrun VMs use the host's network stack, and the worker dials out to
+    # controld from here.
+    network_mode: host
+    stop_grace_period: 30s
+    environment:
+      PUKU_CONTROLD_URL: ${PUKU_CONTROLD_URL:-ws://127.0.0.1:7770/v1/worker}
+      PUKU_WORKER_NAME: ${PUKU_WORKER_NAME:-worker-1}
+      PUKU_WORKER_TOKEN: ${PUKU_WORKER_TOKEN:-}
+      PUKU_CAPACITY_SLOTS:
+      PUKU_CPU_OVERCOMMIT:
+      PUKU_EGRESS_UNRESTRICTED: ${PUKU_EGRESS_UNRESTRICTED:-true}
+      PUKU_MULTI_TENANT:
+      PUKU_EGRESS_ALLOW:
+      PUKU_PREPULL_IMAGES:
+      PUKU_RBD_POOL:
+      PUKU_CEPH_USER: ${PUKU_CEPH_USER:-puku}
+      PUKU_CEPH_CONF: /etc/ceph/ceph.conf
+      PUKU_RBD_SIZE_MIB:
+      PUKU_RBD_MACHINE_SIZE_MIB:
+      SENTRY_DSN:
+      SENTRY_ENVIRONMENT:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Session and machine state, and msb's image store. A host path, so it
+      # outlives the container and a new image.
+      - ${PUKU_WORKER_STATE_DIR:-/var/lib/puku}:/var/lib/puku
+      - /dev:/dev
+      - /lib/modules:/lib/modules:ro
+      - ${CEPH_CONF_DIR:-/etc/ceph}:/etc/ceph:ro
+
+networks:
+  link:
+    name: ${PUKU_LINK_NETWORK:-puku-link}
+
+volumes:
+  pgdata:
+  miniodata:
+  controld-data:

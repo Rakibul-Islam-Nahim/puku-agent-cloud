@@ -27,6 +27,7 @@ terminal. Design doc: [`../AGENT-CLOUD-DESIGN.md`](../AGENT-CLOUD-DESIGN.md).
 
 | Doc | For |
 | --- | --- |
+| [`docs/DOCKER-STACK.md`](docs/DOCKER-STACK.md) | Every service in containers: `docker compose up -d` at the repository root, the endpoints and the keys |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Standing the whole thing up on a bare-metal box, step by step, ending with a test sequence |
 | [`docs/CLI-WALKTHROUGH.md`](docs/CLI-WALKTHROUGH.md) | Driving it from `puku cloud` — teleport, schedules, document runs |
 | [`docs/API.md`](docs/API.md) | The control plane's HTTP API |
@@ -54,6 +55,11 @@ this section is the map and the parts that guide does not cover.
 | One box running real sessions | Linux with `/dev/kvm`, Postgres, the guest image | [2](#2-one-box-dev-or-single-host) |
 | Sessions that survive a dead host | 2+ worker hosts, a Ceph cluster | [3](#3-reliability-surviving-dead-hosts-crashed-vms-and-a-lost-pool) |
 
+**Everything in containers.** `docker-compose.yml` at the repository root
+runs controld, Postgres, MinIO, the Cloudflare tunnel and a libkrun worker:
+`./deploy/scripts/stack-init.sh` once, then `docker compose up -d`. See
+[`docs/DOCKER-STACK.md`](docs/DOCKER-STACK.md).
+
 ### Prerequisites
 
 | What | Why | Install |
@@ -67,7 +73,8 @@ this section is the map and the parts that guide does not cover.
 | `ceph-common` (`rbd`, `ceph`) | only for shared session disks (section 3) | `sudo apt-get install -y ceph-common` |
 
 controld itself runs anywhere (it is also shipped as a container, see
-`Dockerfile`). Only workerd needs KVM.
+`Dockerfile`). Only workerd needs KVM; it has a container too
+(`Dockerfile.workerd`, libkrun only).
 
 ### 1. Build and test
 
@@ -270,7 +277,9 @@ missed answers in a row (about 45 s) mean the VM died or hung while its host
 stayed up: it is torn down, its disk released, and controld starts it again
 (a session that was mid-turn continues with a "your VM crashed, continue"
 message; one waiting for an answer is only stopped). A third crash within 30
-minutes stops the automatic restarts and the reason says so.
+minutes stops the automatic restarts and the reason says so. The same applies
+when a worker reconnects without a session it was running (its container was
+restarted, say): the VM is gone, so the session restarts on its own disk.
 
 **Off-cluster disk backups.** Ceph's three copies cover a lost drive or host,
 not a lost pool. With shared disks, object storage (our MinIO, set with `PUKU_R2_*`) and

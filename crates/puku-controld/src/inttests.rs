@@ -2555,6 +2555,39 @@ async fn a_crashed_machine_vm_is_booted_again() {
     assert_eq!(again.generation, spec.generation + 1);
 }
 
+/// A worker that comes back within its lease without a session it was
+/// running (a restarted worker container: its VMs went with it) gets the
+/// session back as a crash restart, not a session stuck "running" for ever.
+#[tokio::test]
+async fn a_session_a_returning_worker_no_longer_runs_is_restarted() {
+    let h = harness!();
+    let mut w = FakeWorker::connect(&h, "w-restarted", "test-worker-token").await.unwrap();
+    let id = running_session_with_conversation(&h, &mut w, "build it").await;
+    drop(w);
+    until_workers_gone(&h).await;
+
+    let mut back = FakeWorker::connect_returning(&h, "w-restarted", vec![]).await.unwrap();
+    let spec = back.next_assignment().await.expect("restarted on its own disk");
+    assert_eq!(spec.session_id, id);
+    assert!(spec.resume, "the same conversation");
+    assert_eq!(spec.prompt, crate::crashes::CRASH_PROMPT);
+}
+
+/// One that still runs it is left alone.
+#[tokio::test]
+async fn a_session_a_returning_worker_still_runs_is_left_alone() {
+    let h = harness!();
+    let mut w = FakeWorker::connect(&h, "w-reattached", "test-worker-token").await.unwrap();
+    let id = running_session(&h, &mut w, "work").await;
+    drop(w);
+    until_workers_gone(&h).await;
+
+    let mut back = FakeWorker::connect_returning(&h, "w-reattached", vec![id]).await.unwrap();
+    back.assert_no_assignment(std::time::Duration::from_secs(1)).await;
+    let (_, s) = h.get(&format!("/v1/sessions/{id}")).await;
+    assert_eq!(s["state"], "running", "{s}");
+}
+
 /// A crash report from a worker that lost the session restarts nothing.
 #[tokio::test]
 async fn a_crash_report_from_a_worker_that_lost_the_session_is_ignored() {

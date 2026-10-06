@@ -551,6 +551,28 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
         }
     }
 
+    // The reverse: sessions this worker should be running but no longer is.
+    // Their VM died while the worker was away, and the link came back inside
+    // the lease, so no host-loss handling ran. A restarted worker container
+    // does this: its VMs, and the shared disks it had mounted, go with it, so
+    // workerd has nothing to reattach. Each is handled like a VM crash:
+    // restarted on its own disk, under the crash-loop guard.
+    let lost: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE worker_id = $1 AND NOT (id = ANY($2)) \
+           AND state IN ('booting','bootstrapping','running','waiting_input')",
+    )
+    .bind(worker_id)
+    .bind(&running_sessions)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    for sid in lost {
+        tracing::warn!(session = %sid, worker = %worker_name, "session VM lost while its worker was away");
+        if let Err(e) = crate::crashes::on_session_crash(&state, sid, "the VM was lost while its worker was away").await {
+            tracing::warn!(session = %sid, error = format!("{e:#}"), "settling a lost session failed");
+        }
+    }
+
     if let Err(e) = reconcile_machines(&state, worker_id, &running_machines).await {
         tracing::warn!(worker = %worker_name, error = format!("{e:#}"), "reconciling machines failed");
     }

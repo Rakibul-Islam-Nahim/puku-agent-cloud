@@ -80,10 +80,10 @@ services:
     ports:
       - "127.0.0.1:7970:7970"
 
-  # quay.io, not Docker Hub: MinIO no longer publishes minio/minio or
-  # minio/mc there, and a pull of either fails as "repository does not exist".
+  # MinIO no longer publishes images: quay.io/minio/* and docker.io/minio/*
+  # refuse anonymous pulls. pgsty/* are Pigsty's community builds of MinIO.
   minio:
-    image: quay.io/minio/minio:latest
+    image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: puku
@@ -100,7 +100,7 @@ services:
   #   PUKU_R2_REGION=us-east-1 PUKU_R2_ACCESS_KEY_ID=puku
   #   PUKU_R2_SECRET_ACCESS_KEY=puku-dev-secret
   minio-init:
-    image: quay.io/minio/mc:latest
+    image: docker.io/pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       - minio
     entrypoint:

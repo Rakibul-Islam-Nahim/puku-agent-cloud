@@ -109,7 +109,10 @@ impl crate::storagegc::PoolAdmin for FakePool {
     }
     async fn snap_create(&self, image: &str, snap: &str) -> anyhow::Result<()> {
         let data = self.read(image).unwrap_or_default();
-        self.snaps.lock().unwrap().insert((image.into(), snap.into()), data);
+        // Like `rbd snap create`: a name that exists is refused, not replaced.
+        let mut snaps = self.snaps.lock().unwrap();
+        anyhow::ensure!(!snaps.contains_key(&(image.into(), snap.into())), "snapshot {image}@{snap} already exists");
+        snaps.insert((image.into(), snap.into()), data);
         Ok(())
     }
     async fn snap_remove(&self, image: &str, snap: &str) -> anyhow::Result<()> {

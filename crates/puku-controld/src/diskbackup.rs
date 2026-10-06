@@ -6,7 +6,7 @@
 //!
 //! **Backup**, per session or machine on a shared disk, every
 //! `interval`:
-//! 1. RBD snapshot `bk-<ms>` of the image (crash-consistent; no pause).
+//! 1. RBD snapshot `bk-<ms>-<backup id>` of the image (crash-consistent; no pause).
 //! 2. First time, or after `DIFF_CAP` diffs: `rbd export` the whole image.
 //!    Otherwise `rbd export-diff` from the previous backup's snapshot -- and
 //!    skip entirely when nothing changed (an idle disk costs nothing).
@@ -165,7 +165,10 @@ impl<'a> Backups<'a> {
         let chain = self.chain(subject).await?;
         let diffs = chain.iter().filter(|r| r.kind == "diff").count();
         let from = (!chain.is_empty() && diffs < DIFF_CAP).then(|| chain.last().unwrap().to_snap.clone());
-        let snap = format!("bk-{}", chrono::Utc::now().timestamp_millis());
+        let id = Uuid::new_v4();
+        // The backup's own id in the name: two backups in one millisecond
+        // would otherwise ask Ceph for the same snapshot twice.
+        let snap = format!("bk-{}-{}", chrono::Utc::now().timestamp_millis(), &id.simple().to_string()[..8]);
         self.ops.snap_create(&image, &snap).await?;
         if let Some(from) = &from {
             if !self.ops.changed_since(&image, from, &snap).await? {
@@ -176,7 +179,6 @@ impl<'a> Backups<'a> {
         }
 
         std::fs::create_dir_all(&self.tmp_dir)?;
-        let id = Uuid::new_v4();
         let plain = self.tmp_dir.join(format!("{id}.export"));
         let plain_s = plain.to_string_lossy().to_string();
         let exported = match &from {

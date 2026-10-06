@@ -27,8 +27,8 @@ pub struct SweepPolicy {
     /// Hold all death declarations when more than this share of live hosts
     /// is suspected...
     pub mass_loss_fraction: f64,
-    /// ...and the fleet is at least this big (a 1-2 host fleet losing one
-    /// host is not a mass event).
+    /// ...and the fleet is at least this big. At least two hosts must be
+    /// suspected either way: one silent host is never a mass event.
     pub mass_loss_min_hosts: usize,
 }
 
@@ -84,7 +84,11 @@ impl LeaseSweeper {
 
         let suspected = self.store.list_suspected().await?;
         let live = self.store.count_live().await?;
+        // One silent host is never a mass event, whatever share of the fleet
+        // it is: in a fleet of three it is already a third, and holding then
+        // would block every failover a small fleet can have.
         if live >= self.policy.mass_loss_min_hosts
+            && suspected.len() >= 2
             && suspected.len() as f64 / live.max(1) as f64 > self.policy.mass_loss_fraction
         {
             report.mass_loss_hold = Some(MassLoss { suspected: suspected.len(), live });
@@ -199,6 +203,20 @@ mod tests {
         let r = f.sweeper.sweep_once().await.unwrap();
         assert!(r.newly_dead.is_empty(), "no host declared dead during a mass loss");
         assert_eq!(r.mass_loss_hold, Some(MassLoss { suspected: 2, live: 4 }));
+    }
+
+    /// Found on real servers: three hosts, one dies. A third of the fleet is
+    /// over the 30% line, but one host is not a mass loss.
+    #[tokio::test]
+    async fn one_host_of_three_dying_is_declared_dead() {
+        let f = fleet(quick());
+        let hosts = [host(&f).await, host(&f).await, host(&f).await];
+        age(&f, hosts[0], 4).await;
+        f.sweeper.sweep_once().await.unwrap();
+        age(&f, hosts[0], 16).await;
+        let r = f.sweeper.sweep_once().await.unwrap();
+        assert_eq!(r.newly_dead, vec![hosts[0]]);
+        assert!(r.mass_loss_hold.is_none());
     }
 
     #[tokio::test]

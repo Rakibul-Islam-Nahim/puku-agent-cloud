@@ -1,6 +1,8 @@
 # Running puku-agent-cloud with Docker Compose
 
-Every puku-agent-cloud service in containers, started with one command:
+Every puku-agent-cloud service in containers, started with one command (for a
+first-time, step-by-step install on three servers, see
+[`DEPLOY-3-MACHINES.md`](DEPLOY-3-MACHINES.md)):
 
 ```bash
 docker compose up -d

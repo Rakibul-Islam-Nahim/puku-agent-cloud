@@ -28,6 +28,7 @@ terminal. Design doc: [`../AGENT-CLOUD-DESIGN.md`](../AGENT-CLOUD-DESIGN.md).
 | Doc | For |
 | --- | --- |
 | [`docs/DOCKER-STACK.md`](docs/DOCKER-STACK.md) | Every service in containers: `docker compose up -d` at the repository root, the endpoints and the keys |
+| [`docs/DEPLOY-3-MACHINES.md`](docs/DEPLOY-3-MACHINES.md) | Step by step for a first-timer: three servers, Ceph, the tunnel, the stack, the failover drill |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Standing the whole thing up on a bare-metal box, step by step, ending with a test sequence |
 | [`docs/CLI-WALKTHROUGH.md`](docs/CLI-WALKTHROUGH.md) | Driving it from `puku cloud` — teleport, schedules, document runs |
 | [`docs/API.md`](docs/API.md) | The control plane's HTTP API |

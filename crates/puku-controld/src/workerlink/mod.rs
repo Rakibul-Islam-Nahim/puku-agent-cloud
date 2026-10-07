@@ -459,6 +459,31 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
 
     let wants_lease = features.iter().any(|f| f == puku_cloud_proto::worker_proto::FEATURE_LEASE);
     let (tx, mut rx) = mpsc::unbounded_channel::<Down>();
+
+    // Reconcile against what the table says BEFORE the worker is visible:
+    // once it is in the registry, new work can be assigned to it at any
+    // moment, and a reconcile that ran after that would read a machine or
+    // session assigned a millisecond ago as one the worker lost. Frames go
+    // into the channel now and reach the worker right after its RegisterAck.
+    //
+    // Sessions this worker should be running but no longer is: their VM died
+    // while the worker was away, and the link came back inside the lease, so
+    // no host-loss handling ran. A restarted worker container does this: its
+    // VMs, and the shared disks it had mounted, go with it. Each is restarted
+    // like a VM crash, once the worker is registered (below).
+    let lost_sessions: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE worker_id = $1 AND NOT (id = ANY($2)) \
+           AND state IN ('booting','bootstrapping','running','waiting_input')",
+    )
+    .bind(worker_id)
+    .bind(&running_sessions)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    if let Err(e) = reconcile_machines(&state, worker_id, &running_machines, &tx).await {
+        tracing::warn!(worker = %worker_name, error = format!("{e:#}"), "reconciling machines failed");
+    }
+
     let handle = WorkerHandle {
         worker_id,
         name: worker_name.clone(),
@@ -551,30 +576,16 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
         }
     }
 
-    // The reverse: sessions this worker should be running but no longer is.
-    // Their VM died while the worker was away, and the link came back inside
-    // the lease, so no host-loss handling ran. A restarted worker container
-    // does this: its VMs, and the shared disks it had mounted, go with it, so
-    // workerd has nothing to reattach. Each is handled like a VM crash:
-    // restarted on its own disk, under the crash-loop guard.
-    let lost: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM sessions WHERE worker_id = $1 AND NOT (id = ANY($2)) \
-           AND state IN ('booting','bootstrapping','running','waiting_input')",
-    )
-    .bind(worker_id)
-    .bind(&running_sessions)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-    for sid in lost {
+    // The lost sessions found before registration: restarted on their own
+    // disk under the crash-loop guard, unless one has moved on meanwhile.
+    for sid in lost_sessions {
+        if !owns_session(&state, worker_id, sid).await.unwrap_or(false) {
+            continue;
+        }
         tracing::warn!(session = %sid, worker = %worker_name, "session VM lost while its worker was away");
         if let Err(e) = crate::crashes::on_session_crash(&state, sid, "the VM was lost while its worker was away").await {
             tracing::warn!(session = %sid, error = format!("{e:#}"), "settling a lost session failed");
         }
-    }
-
-    if let Err(e) = reconcile_machines(&state, worker_id, &running_machines).await {
-        tracing::warn!(worker = %worker_name, error = format!("{e:#}"), "reconciling machines failed");
     }
 
     // Newly-online worker may unblock queued sessions.
@@ -643,8 +654,18 @@ pub async fn handle_worker_socket(state: AppState, socket: WebSocket) {
 /// destroy it); the table says a VM runs there and the worker no longer has
 /// it (it died with the worker: mark it stopped, volume intact); and an
 /// assignment that never arrived (requeue it).
-async fn reconcile_machines(state: &AppState, worker_id: Uuid, running: &[Uuid]) -> anyhow::Result<()> {
-    let Some(handle) = state.workers.get(worker_id) else { return Ok(()) };
+///
+/// Runs before the worker is in the registry (see the caller), so `tx` is
+/// its channel rather than a registry handle.
+async fn reconcile_machines(
+    state: &AppState,
+    worker_id: Uuid,
+    running: &[Uuid],
+    tx: &mpsc::UnboundedSender<Down>,
+) -> anyhow::Result<()> {
+    let send = |frame: Down| {
+        let _ = tx.send(frame);
+    };
     for id in running {
         match db::machines::get(&state.pool, *id).await? {
             Some(m)
@@ -652,14 +673,14 @@ async fn reconcile_machines(state: &AppState, worker_id: Uuid, running: &[Uuid])
                     && matches!(m.state.as_str(), "restoring" | "booting" | "running" | "stopping") =>
             {
                 if m.state == "stopping" {
-                    handle.send(Down::StopMachine { machine_id: *id, generation: m.generation as u64, snapshot: None });
+                    send(Down::StopMachine { machine_id: *id, generation: m.generation as u64, snapshot: None });
                 }
             }
             Some(m) if m.state != "destroyed" => {
-                handle.send(Down::StopMachine { machine_id: *id, generation: m.generation as u64, snapshot: None });
+                send(Down::StopMachine { machine_id: *id, generation: m.generation as u64, snapshot: None });
             }
             _ => {
-                handle.send(Down::DestroyMachine { machine_id: *id, final_snapshot: None });
+                send(Down::DestroyMachine { machine_id: *id, final_snapshot: None });
             }
         }
     }
